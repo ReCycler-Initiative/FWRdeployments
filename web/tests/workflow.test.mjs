@@ -4,6 +4,206 @@ import { Pool } from "pg";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+async function confirmDecision(base, id, candidateId) {
+  const workspace = await (await fetch(`${base}/api/projects/${id}`)).json();
+  const response = await fetch(`${base}/api/projects/${id}/decision`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      candidate_id: candidateId, expected_iteration_id: workspace.iteration.id,
+      decision_rationale: "Reviewed the supplied evidence and alternatives.",
+      hypothesis: "Pilot one team and measure handover time before expanding.",
+    }),
+  });
+  assert.equal(response.status, 201, await response.text());
+}
+
+async function completeDecision(base, id) {
+  const workspace = await (await fetch(`${base}/api/projects/${id}`)).json();
+  const response = await fetch(`${base}/api/projects/${id}/complete`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      expected_iteration_id: workspace.iteration.id, expected_delivery_id: workspace.project.active_delivery_id,
+      feedback: "Synthetic output reviewed. Actual effects remain to be measured.",
+    }),
+  });
+  assert.equal(response.status, 200, await response.text());
+}
+
+test("iteration-aware saving reuses one open iteration and preserves completed decisions and baselines", { timeout: 30000 }, async (context) => {
+  const base = process.env.TEST_WEB_URL;
+  assert.ok(base && process.env.DATABASE_URL && process.env.MEDIA_DIR);
+  const db = new Pool({ connectionString: process.env.DATABASE_URL });
+  let id;
+  const json = (body) => ({
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  try {
+    const schema = await db.query("SELECT to_regclass('public.ooda_iterations') AS iterations");
+    if (!schema.rows[0].iterations) {
+      context.skip("Legacy schema: covered by the OODA workspace test");
+      return;
+    }
+    const created = await fetch(`${base}/api/projects`, json({
+      title: "Iteration compatibility fixture", description: "Keep baseline and decision history", target_systems: [],
+    }));
+    assert.equal(created.status, 201);
+    id = (await created.json()).id;
+    const route = `${base}/api/projects/${id}`;
+    const first = (await db.query("SELECT * FROM ooda_iterations WHERE project_id=$1", [id])).rows[0];
+    assert.ok(first, "Project creation opens its first iteration");
+    assert.equal(first.iteration_number, 1);
+    const planned = await Promise.all(["First", "Second"].map((title) => fetch(`${route}/workshops`, json({ title }))));
+    for (const response of planned) assert.equal(response.status, 201);
+    const workshops = (await db.query("SELECT iteration_id FROM sessions WHERE project_id=$1", [id])).rows;
+    assert.equal(workshops.length, 2);
+    assert.ok(workshops.every((workshop) => workshop.iteration_id === first.id));
+    assert.equal((await db.query("SELECT count(*) FROM ooda_iterations WHERE project_id=$1", [id])).rows[0].count, "1");
+
+    const candidate = (await db.query(
+      "INSERT INTO solution_candidates(project_id,title,is_selected,implementation_notes) VALUES($1,'Locked choice',true,'Keep measured impact') RETURNING id", [id],
+    )).rows[0].id;
+    const delivery = (await db.query(
+      "UPDATE projects SET status='READY_FOR_REVIEW',delivery_mode='PROMPTS',active_delivery_id=gen_random_uuid() WHERE id=$1 RETURNING active_delivery_id", [id],
+    )).rows[0].active_delivery_id;
+    await db.query(
+      "UPDATE ooda_iterations SET status='ACT',selected_solution_id=$2,decision_rationale='Reviewed evidence',hypothesis='Reduce handoffs',decided_at=NOW() WHERE id=$1",
+      [first.id, candidate],
+    );
+    await db.query(
+      "UPDATE ooda_iterations SET status='COMPLETED',completed_at=NOW(),accepted_delivery_id=$2 WHERE id=$1", [first.id, delivery],
+    );
+    const locked = (await db.query("SELECT * FROM ooda_iterations WHERE id=$1", [first.id])).rows[0];
+    const latestBaseline = (await db.query(
+      "INSERT INTO baseline_versions(project_id,version_number,summary,snapshot) VALUES($1,1,'Accepted outcome',$2::jsonb) RETURNING id",
+      [id, JSON.stringify({ documents: [], accepted_deliveries: [{ id: delivery }] })],
+    )).rows[0].id;
+    const baselines = (await db.query("SELECT * FROM baseline_versions WHERE project_id=$1 ORDER BY version_number", [id])).rows;
+    const feedback = new FormData();
+    feedback.set("title", "New observations");
+    feedback.set("file", new File(["Fresh observations after acting"], "new-feedback.txt"));
+    feedback.set("analyze", "false");
+    const saved = await fetch(`${route}/sessions`, { method: "POST", body: feedback });
+    assert.equal(saved.status, 201);
+    const sessionId = (await saved.json()).session_id;
+    const second = (await db.query("SELECT * FROM ooda_iterations WHERE project_id=$1 AND status <> 'COMPLETED'", [id])).rows[0];
+    assert.equal(second.iteration_number, 2);
+    assert.equal(second.baseline_version_id, latestBaseline);
+    assert.equal((await db.query("SELECT iteration_id FROM sessions WHERE id=$1", [sessionId])).rows[0].iteration_id, second.id);
+    assert.deepEqual((await db.query("SELECT * FROM ooda_iterations WHERE id=$1", [first.id])).rows[0], locked);
+    assert.deepEqual((await db.query("SELECT * FROM baseline_versions WHERE project_id=$1 ORDER BY version_number", [id])).rows, baselines);
+    const selected = (await db.query("SELECT is_selected,implementation_notes FROM solution_candidates WHERE id=$1", [candidate])).rows[0];
+    assert.equal(selected.is_selected, true);
+    assert.equal(selected.implementation_notes, "Keep measured impact");
+    assert.equal((await db.query("SELECT active_delivery_id FROM projects WHERE id=$1", [id])).rows[0].active_delivery_id, delivery);
+  } finally {
+    if (id) {
+      await db.query("DELETE FROM projects WHERE id=$1", [id]);
+      await rm(path.join(process.env.MEDIA_DIR, id), { recursive: true, force: true });
+    }
+    await db.end();
+  }
+});
+
+test("OODA workspace separates evidence, interpretation, approval and feedback without mutating decisions", { timeout: 30000 }, async () => {
+  const base = process.env.TEST_WEB_URL;
+  assert.ok(base && process.env.DATABASE_URL && process.env.MEDIA_DIR);
+  const db = new Pool({ connectionString: process.env.DATABASE_URL });
+  let id;
+  const view = async (stage, locale = "en") => {
+    const response = await fetch(`${base}/projects/${id}`, { headers: { Cookie: `frw_locale=${locale}` } });
+    assert.equal(response.status, 200);
+    const main = (await response.text()).match(/<main\b[^>]*>[\s\S]*?<\/main>/)?.[0];
+    assert.ok(main);
+    assert.match(main, new RegExp(`<button[^>]*aria-selected="true"[^>]*id="tab-${stage}"`));
+    assert.match(main, new RegExp(`<section id="stage-${stage}"`));
+    assert.equal((main.match(/role="tab"/g) ?? []).length, 4);
+    return main;
+  };
+  try {
+    const created = await fetch(`${base}/api/projects`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "OODA isolated fixture", description: "Evidence to action and back", target_systems: [] }),
+    });
+    assert.equal(created.status, 201);
+    id = (await created.json()).id;
+    const observed = await view(0);
+    assert.match(observed, /Shared evidence/);
+    assert.match(observed, /Next useful step/);
+    assert.match(observed, /Add context/);
+    assert.match(await view(0, "fi"), /Havainnoi/);
+    assert.match(await view(0, "fi"), /Ymmärrä/);
+
+    const material = new FormData();
+    material.set("file", new File(["A customer observation"], "evidence.txt"));
+    material.set("title", "Observation workshop");
+    material.set("analyze", "false");
+    const uploaded = await fetch(`${base}/api/projects/${id}/sessions`, { method: "POST", body: material });
+    assert.equal(uploaded.status, 201);
+    const sessionId = (await uploaded.json()).session_id;
+    const oriented = await view(1);
+    assert.match(oriented, /Understand the situation before deciding/);
+    assert.match(oriented, /Analyze workshop/);
+    assert.doesNotMatch(oriented, /Compare solution candidates/);
+
+    await db.query("UPDATE sessions SET processed_at=NOW(),pain_points_json='[]',analysis_mode='mock' WHERE id=$1", [sessionId]);
+    const candidate = (await db.query(
+      "INSERT INTO solution_candidates(project_id,title,generation_mode) VALUES($1,'Keep this decision','mock') RETURNING id", [id],
+    )).rows[0].id;
+    await db.query("UPDATE projects SET status='CANDIDATES_READY' WHERE id=$1", [id]);
+    const decided = await view(2);
+    assert.match(decided, /Choose the next action/);
+    assert.match(decided, /Keep this decision/);
+    assert.doesNotMatch(decided, /Observation strength/);
+
+    await confirmDecision(base, id, candidate);
+    await db.query("UPDATE solution_candidates SET implementation_notes='Measured improvement' WHERE id=$1", [candidate]);
+    const output = await fetch(`${base}/api/projects/${id}/approve`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ candidate_id: candidate, delivery_mode: "PLAN", expected_delivery_id: null }),
+    });
+    assert.equal(output.status, 200);
+    const acted = await view(3);
+    assert.match(acted, /What did we learn from acting/);
+    assert.match(acted, /Add new observations/);
+    assert.match(acted, /Measured improvement/);
+    const after = await (await fetch(`${base}/api/projects/${id}`)).json();
+    assert.equal(after.project.status, "READY_FOR_REVIEW");
+    assert.equal(after.candidates.find((item) => item.id === candidate).is_selected, true);
+    assert.equal(after.candidates.find((item) => item.id === candidate).implementation_notes, "Measured improvement");
+    assert.equal(after.tasks.length, 0, "Viewing or navigating never starts agent work");
+    const staleReview = await fetch(`${base}/api/projects/${id}/complete`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        expected_iteration_id: after.iteration.id,
+        expected_delivery_id: "00000000-0000-4000-8000-000000000001", feedback: "Stale review",
+      }),
+    });
+    assert.equal(staleReview.status, 409, "Review must identify the current output");
+    await completeDecision(base, id);
+    const feedback = new FormData();
+    feedback.set("file", new File(["Observed effects from the experiment"], "feedback.txt"));
+    feedback.set("title", "Feedback workshop");
+    feedback.set("analyze", "false");
+    const savedFeedback = await fetch(`${base}/api/projects/${id}/sessions`, { method: "POST", body: feedback });
+    assert.equal(savedFeedback.status, 201);
+    assert.match(await view(1), /Feedback workshop/);
+    const nextLoop = await (await fetch(`${base}/api/projects/${id}`)).json();
+    assert.equal(nextLoop.sessions.length, 2);
+    assert.equal(nextLoop.iteration.iteration_number, after.iteration.iteration_number + 1);
+    assert.notEqual(nextLoop.iteration.id, after.iteration.id);
+    assert.equal((await db.query("SELECT status FROM ooda_iterations WHERE id=$1", [after.iteration.id])).rows[0].status, "COMPLETED");
+    assert.equal(nextLoop.candidates.find((item) => item.id === candidate).is_selected, true);
+    assert.equal(nextLoop.candidates.find((item) => item.id === candidate).is_superseded, true);
+    assert.equal(nextLoop.candidates.find((item) => item.id === candidate).implementation_notes, "Measured improvement");
+  } finally {
+    if (id) {
+      await db.query("DELETE FROM projects WHERE id=$1", [id]);
+      await rm(path.join(process.env.MEDIA_DIR, id), { recursive: true, force: true });
+    }
+    await db.end();
+  }
+});
+
 test("project deletion requires confirmation, blocks active work and removes only the target project", { timeout: 30000 }, async () => {
   const base = process.env.TEST_WEB_URL;
   assert.ok(base && process.env.DATABASE_URL && process.env.MEDIA_DIR && process.env.WORKER_URL);
@@ -181,7 +381,43 @@ test("non-code outputs create versioned source-referenced documents without star
        '["Shared understanding"]','["Missing baseline"]') RETURNING id`, [id],
     )).rows[0];
     await db.query("UPDATE projects SET status='CANDIDATES_READY' WHERE id=$1", [id]);
-    let deliveryId;
+    const beforeDecision = await fetch(`${route}/approve`, post({
+      candidate_id: candidate.id, delivery_mode: "REPORT", expected_delivery_id: null,
+    }));
+    assert.equal(beforeDecision.status, 409, "An output cannot substitute for an explicit decision");
+    const workerBeforeDecision = await fetch(`${process.env.WORKER_URL}/api/projects/${id}/generate-output`, post({
+      candidate_id: candidate.id, output_type: "REPORT",
+    }));
+    assert.equal(workerBeforeDecision.status, 409, "The worker independently enforces the ACT decision");
+    const initial = await (await fetch(route)).json();
+    const decisionBody = {
+      candidate_id: candidate.id, expected_iteration_id: initial.iteration.id,
+      decision_rationale: "Reviewed the alternatives.", hypothesis: "Measure the pilot.",
+    };
+    for (const [change, expected] of [
+      [{ decision_rationale: "   " }, 400],
+      [{ expected_iteration_id: "00000000-0000-4000-8000-000000000001" }, 409],
+    ]) {
+      assert.equal((await fetch(`${route}/decision`, post({ ...decisionBody, ...change }))).status, expected);
+    }
+    await confirmDecision(base, id, candidate.id);
+    const decided = await (await fetch(route)).json();
+    assert.equal(decided.iteration.status, "ACT");
+    assert.equal(decided.iteration.selected_solution_id, candidate.id);
+    assert.equal(decided.artifacts.length, 0, "Decision confirmation creates no output");
+    assert.equal(decided.tasks.length, 0);
+    const decidedHtml = await (await fetch(`${base}/projects/${id}`, { headers: { Cookie: "frw_locale=en" } })).text();
+    assert.match(decidedHtml, /Create an output supporting the decision/);
+    assert.equal((await fetch(`${route}/complete`, post({
+      expected_iteration_id: decided.iteration.id,
+      expected_delivery_id: "00000000-0000-4000-8000-000000000001", feedback: "Not ready yet.",
+    }))).status, 409, "An unexecuted decision cannot be accepted as a completed output");
+    const revisedDecision = await fetch(`${route}/decision`, post({
+      candidate_id: candidate.id, expected_iteration_id: decided.iteration.id,
+      decision_rationale: "Replace the earlier decision.", hypothesis: "A different action.",
+    }));
+    assert.equal(revisedDecision.status, 409, "A confirmed decision cannot be silently overwritten");
+    let deliveryId = null;
     const earlier = [];
     for (const [mode, filename, expected] of [
       ["REPORT", "report.md", /completed research finding/],
@@ -195,7 +431,7 @@ test("non-code outputs create versioned source-referenced documents without star
       }
       const approval = await fetch(`${route}/approve`, post({
         candidate_id: candidate.id, delivery_mode: mode, refinement: "Confirm the accountable person.",
-        ...(deliveryId ? { expected_delivery_id: deliveryId } : {}),
+        expected_delivery_id: deliveryId,
       }));
       assert.equal(approval.status, 200, await approval.text());
       const workspace = await (await fetch(route)).json();
@@ -214,6 +450,9 @@ test("non-code outputs create versioned source-referenced documents without star
       assert.match(content, /Vastuun siirto kestää tunnin/);
       assert.match(content, /No one owns the handover/);
       assert.match(content, /Confirm the accountable person/);
+      assert.match(content, /Pilot one team and measure handover time/);
+      assert.equal(workspace.iteration.id, decided.iteration.id, "Changing output types does not start another decision cycle");
+      assert.equal(workspace.iteration.selected_solution_id, candidate.id);
       const metadata = JSON.parse(await readFile(path.join(process.env.MEDIA_DIR, id, "artifacts", "delivery", deliveryId, "output-provenance.json"), "utf8"));
       assert.equal(metadata.external_research, false);
       assert.equal(metadata.output_type, mode);
@@ -325,7 +564,7 @@ test("language preference, project content language and English exports remain i
     assert.equal(workspace.sessions[0].analysis_mode, "mock");
     assert.ok(workspace.candidates.every((candidate) => candidate.generation_mode === "mock" && !("estimated_cost" in candidate)));
     const workspaceHtml = await (await fetch(`${base}/projects/${id}`, { headers: { Cookie: "frw_locale=en" } })).text();
-    assert.match(workspaceHtml, /Choose an outcome/);
+    assert.match(workspaceHtml, /Confirm the next action/);
     assert.match(workspaceHtml, /Demo mode/);
     assert.match(workspaceHtml, /not evidence-based AI output/);
     assert.doesNotMatch(workspaceHtml, /What outcome is enough for the customer|candidate-price/);
@@ -347,7 +586,8 @@ test("language preference, project content language and English exports remain i
       }
       if (target !== "plan") assert.match(draft.data.prompt, /Alkuperäinen lähde säilyy/);
     }
-    await post(`/api/projects/${id}/approve`, { candidate_id: workspace.candidates[0].id, delivery_mode: "PROMPTS" });
+    await confirmDecision(base, id, workspace.candidates[0].id);
+    await post(`/api/projects/${id}/approve`, { candidate_id: workspace.candidates[0].id, delivery_mode: "PROMPTS", expected_delivery_id: null });
     workspace = await (await fetch(`${base}/api/projects/${id}`)).json();
     assert.equal(workspace.project.language, "en");
     assert.equal(workspace.tasks.length, 0);
@@ -359,17 +599,23 @@ test("language preference, project content language and English exports remain i
     const firstDelivery = workspace.project.active_delivery_id;
     const originalFiles = workspace.artifacts.map((artifact) => artifact.path);
     const alternative = workspace.candidates.find((candidate) => !candidate.is_selected);
+    const wrongSolution = await fetch(`${base}/api/projects/${id}/approve`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ candidate_id: alternative.id, delivery_mode: "PLAN", expected_delivery_id: firstDelivery }),
+    });
+    assert.equal(wrongSolution.status, 409, "An output type change must not replace the locked solution");
+    const chosen = workspace.candidates.find((candidate) => candidate.is_selected).id;
     await post(`/api/projects/${id}/approve`, {
-      candidate_id: alternative.id, delivery_mode: "PLAN", expected_delivery_id: firstDelivery,
+      candidate_id: chosen, delivery_mode: "PLAN", expected_delivery_id: firstDelivery,
     });
     const replaced = await (await fetch(`${base}/api/projects/${id}`)).json();
     assert.notEqual(replaced.project.active_delivery_id, firstDelivery);
-    assert.equal(replaced.candidates.find((candidate) => candidate.is_selected).id, alternative.id);
+    assert.equal(replaced.candidates.find((candidate) => candidate.is_selected).id, chosen);
     assert.equal(replaced.candidates.filter((candidate) => candidate.is_selected).length, 1);
     assert.ok(originalFiles.every((file) => replaced.artifacts.some((artifact) => artifact.path === file)));
     assert.equal(replaced.artifacts.length, originalFiles.length + 1);
     const replacedHtml = await (await fetch(`${base}/projects/${id}`, { headers: { Cookie: "frw_locale=en" } })).text();
-    assert.match(replacedHtml, /Compare alternatives or change selection/);
+    assert.match(replacedHtml, /View decision or solution options/);
     assert.match(replacedHtml, /Previous deliveries/);
   } finally {
     for (const id of projects) {
@@ -441,7 +687,8 @@ test("mock workspace: preparation, upload, analysis, selection and four-agent de
           assert.match(recordedAi.data.prompt, /Kandidaatti: AI-generoitu luonnos/,
             "Recorded output provenance must not be relabeled by current mock configuration");
         }
-        const approved = await post(`/api/projects/${id}/approve`, { candidate_id, delivery_mode, refinement });
+        await confirmDecision(base, id, candidate_id);
+        const approved = await post(`/api/projects/${id}/approve`, { candidate_id, delivery_mode, refinement, expected_delivery_id: null });
         assert.equal(approved.status, 200);
         const workspace = await (await fetch(`${base}/api/projects/${id}`)).json();
         assert.equal(workspace.project.status, "READY_FOR_REVIEW");
@@ -452,11 +699,14 @@ test("mock workspace: preparation, upload, analysis, selection and four-agent de
         assert.equal(workspace.artifacts.length, 1, "A shared prompt must not be duplicated per tool");
         const preview = await (await fetch(`${base}/api/projects/${id}/artifacts?path=${encodeURIComponent(workspace.artifacts[0].path)}`)).json();
         assert.match(preview.content, /Pilotti ilman integraatioita/);
+        assert.match(preview.content, /Pilot one team and measure handover time/);
         assert.doesNotMatch(preview.content, /1000|EUR|kustannusarvio|Alustava budjetti/);
         if (delivery_mode === "PROMPTS") assert.doesNotMatch(preview.content, /EI HYVÄKSYTTY/);
-        assert.equal((await post(`/api/projects/${id}/approve`, { candidate_id, delivery_mode, refinement })).status, 200);
+        assert.equal((await post(`/api/projects/${id}/approve`, {
+          candidate_id, delivery_mode, refinement, expected_delivery_id: workspace.project.active_delivery_id,
+        })).status, 200);
         const repeated = await (await fetch(`${base}/api/projects/${id}`)).json();
-        assert.equal(repeated.artifacts.length, workspace.artifacts.length, "Repeated approval must not duplicate exports");
+        assert.equal(repeated.artifacts.length, workspace.artifacts.length + 1, "Explicit output creation saves an immutable new version");
         const progress = await fetch(`${base}/api/projects/${id}/implementation`, {
           method: "PATCH", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -593,7 +843,7 @@ test("mock workspace: preparation, upload, analysis, selection and four-agent de
     const storedCosts = await db.query("SELECT estimated_cost FROM solution_candidates WHERE project_id=$1", [id]);
     assert.ok(storedCosts.rows.every((row) => row.estimated_cost === null), "New candidates must not store generated prices");
     const workspaceHtml = await (await fetch(`${base}/projects/${id}`)).text();
-    assert.match(workspaceHtml, /Valitse lopputulos/);
+    assert.match(workspaceHtml, /Valitse seuraava teko/);
     assert.match(workspaceHtml, /Esimerkkisisältö/);
     assert.doesNotMatch(workspaceHtml, /Mikä lopputulos riittää asiakkaalle|candidate-price/);
     const firstSessionId = snapshot.sessions[0].id;
@@ -632,7 +882,8 @@ test("mock workspace: preparation, upload, analysis, selection and four-agent de
       candidate_id: snapshot.candidates[0].id,
     }))).status));
     const chosen = snapshot.candidates[0].id;
-    assert.equal((await call(`${route}/build`, post({ candidate_id: chosen }))).status, 202);
+    await confirmDecision(base, id, chosen);
+    assert.equal((await call(`${route}/build`, post({ candidate_id: chosen, expected_delivery_id: null }))).status, 202);
     const started = (await call(route)).data;
     assert.equal(started.project.status, "BUILDING");
     assert.equal(started.candidates.filter((candidate) => candidate.is_selected).length, 1);
@@ -673,13 +924,19 @@ test("mock workspace: preparation, upload, analysis, selection and four-agent de
       "Replacing an approval requires the expected current delivery");
     assert.equal((await call(`${route}/build`, post({
       candidate_id: alternative, expected_delivery_id: firstDelivery,
-    }))).status, 202);
-    snapshot = await waitFor(id, (value) => value.project.status === "READY_FOR_REVIEW");
+    }))).status, 409, "An active ACT decision cannot be replaced by a delivery request");
+    assert.equal((await call(`${route}/decision`, post({
+      candidate_id: alternative, expected_iteration_id: snapshot.iteration.id,
+      decision_rationale: "Try another approach", hypothesis: "A different pilot",
+    }))).status, 409);
+    assert.equal((await call(`${route}/approve`, post({
+      candidate_id: chosen, delivery_mode: "PLAN", expected_delivery_id: firstDelivery,
+    }))).status, 200);
+    snapshot = (await call(route)).data;
     const secondDelivery = snapshot.project.active_delivery_id;
     assert.notEqual(secondDelivery, firstDelivery);
-    assert.equal(snapshot.tasks.length, 4, "Only the active run belongs in the Kanban");
-    assert.ok(snapshot.tasks.every((task) => task.candidate_id === alternative && task.delivery_id === secondDelivery));
-    assert.equal(Number((await db.query("SELECT count(*) FROM agent_tasks WHERE project_id=$1", [id])).rows[0].count), 8,
+    assert.equal(snapshot.tasks.length, 0, "The earlier agent run is not the current plan's run");
+    assert.equal(Number((await db.query("SELECT count(*) FROM agent_tasks WHERE project_id=$1", [id])).rows[0].count), 4,
       "Previous agent logs must remain stored");
     assert.equal((await call(`${route}/artifacts?path=${encodeURIComponent(file.path)}`)).data.content, preview.data.content,
       "Starting another run must never overwrite earlier artifacts");
@@ -688,7 +945,7 @@ test("mock workspace: preparation, upload, analysis, selection and four-agent de
       candidate_id: chosen, delivery_mode: "PLAN", expected_delivery_id: firstDelivery,
     }))).status, 409, "A stale browser must not replace the current decision");
     assert.equal((await call(`${route}/approve`, post({
-      candidate_id: alternative, delivery_mode: "PLAN", expected_delivery_id: secondDelivery,
+      candidate_id: chosen, delivery_mode: "PLAN", expected_delivery_id: secondDelivery,
     }))).status, 200, "The outcome can change without changing the candidate");
     snapshot = (await call(route)).data;
     assert.equal(snapshot.tasks.length, 0, "Previous agents must not appear as the current plan's agents");
@@ -696,16 +953,27 @@ test("mock workspace: preparation, upload, analysis, selection and four-agent de
     assert.equal(snapshot.artifacts.filter((artifact) =>
       artifact.path.startsWith(`delivery/${snapshot.project.active_delivery_id}/`)).length, 1);
     assert.equal((await call(`${route}/approve`, post({
-      candidate_id: alternative, delivery_mode: "PROMPTS", expected_delivery_id: snapshot.project.active_delivery_id,
+      candidate_id: chosen, delivery_mode: "PROMPTS", expected_delivery_id: snapshot.project.active_delivery_id,
     }))).status, 200);
     snapshot = (await call(route)).data;
     assert.equal(snapshot.tasks.length, 0);
     assert.equal((await call(`${route}/build`, post({
       candidate_id: chosen, expected_delivery_id: snapshot.project.active_delivery_id,
-    }))).status, 202, "A previously selected candidate can be selected again");
+    }))).status, 202, "The same confirmed solution can have another agent delivery");
     snapshot = await waitFor(id, (value) => value.project.status === "READY_FOR_REVIEW");
     assert.equal(snapshot.tasks.length, 4);
     assert.ok(snapshot.tasks.every((task) => task.candidate_id === chosen && task.delivery_id === snapshot.project.active_delivery_id));
+    assert.equal(Number((await db.query("SELECT count(*) FROM agent_tasks WHERE project_id=$1", [id])).rows[0].count), 8);
+    const lastDelivery = snapshot.project.active_delivery_id;
+    assert.equal((await call(`${route}/build`, post({
+      candidate_id: chosen, expected_delivery_id: firstDelivery,
+    }))).status, 409, "A stale retry must not create another agent run");
+    assert.equal((await call(`${route}/build`, post({
+      candidate_id: chosen, expected_delivery_id: lastDelivery, refinement: "Limit this version to one team.",
+    }))).status, 202, "An explicit new agent version retains the confirmed decision");
+    snapshot = await waitFor(id, (value) => value.project.status === "READY_FOR_REVIEW");
+    assert.notEqual(snapshot.project.active_delivery_id, lastDelivery);
+    assert.equal(snapshot.iteration.selected_solution_id, chosen);
     assert.equal(Number((await db.query("SELECT count(*) FROM agent_tasks WHERE project_id=$1", [id])).rows[0].count), 12);
     assert.equal((await call(`${route}/artifacts?path=${encodeURIComponent(file.path)}`)).data.content, preview.data.content);
   } finally {
@@ -764,12 +1032,18 @@ test("multiple named transcripts add, deduplicate, analyze and change only the t
         const firstId = (await firstSave.json()).transcript_id;
         await create(`${route}/analyze`, { session_id: workshop.id });
         let current = await ready();
-        await create(`${route}/approve`, { candidate_id: current.candidates[0].id, delivery_mode: "PROMPTS" });
+        await confirmDecision(base, id, current.candidates[0].id);
+        await create(`${route}/approve`, { candidate_id: current.candidates[0].id, delivery_mode: "PROMPTS", expected_delivery_id: null });
         current = await snapshot();
         const delivery = current.project.active_delivery_id;
         const artifact = current.artifacts[0].path;
         const artifactFile = path.join(process.env.MEDIA_DIR, id, "artifacts", artifact);
         const originalExport = await readFile(artifactFile, "utf8");
+        await completeDecision(base, id);
+        const baseline = (await db.query(
+          "SELECT snapshot FROM baseline_versions WHERE project_id=$1 AND version_number=1", [id],
+        )).rows[0].snapshot;
+        assert.match(JSON.stringify(baseline.workshops), /FIRST SOURCE/);
         const secondUpload = material("SECOND ORIGINAL SOURCE", "Unused workshop rename");
         secondUpload.body.set("session_id", workshop.id);
         secondUpload.body.set("analyze", "false");
@@ -913,16 +1187,25 @@ test("workshop transcripts can be saved, corrected and removed without losing wo
     await post(`/api/projects/${id}/analyze`, { session_id: first.id });
     current = await ready();
     const originalCandidate = current.candidates[0].id;
-    await post(`/api/projects/${id}/approve`, { candidate_id: originalCandidate, delivery_mode: "PROMPTS" });
+    await confirmDecision(base, id, originalCandidate);
+    await post(`/api/projects/${id}/approve`, { candidate_id: originalCandidate, delivery_mode: "PROMPTS", expected_delivery_id: null });
     current = await workspace();
     const originalDelivery = current.project.active_delivery_id;
     const originalArtifact = current.artifacts[0].path;
     const originalContent = await readFile(path.join(process.env.MEDIA_DIR, id, "artifacts", originalArtifact), "utf8");
     assert.match(originalContent, /WRONG ORIGINAL TRANSCRIPT/);
+    await completeDecision(base, id);
+    const baseline = (await db.query(
+      "SELECT snapshot FROM baseline_versions WHERE project_id=$1 AND version_number=1", [id],
+    )).rows[0].snapshot;
+    assert.match(JSON.stringify(baseline.workshops), /WRONG ORIGINAL TRANSCRIPT/);
     assert.equal((await save(first.id, vtt("CORRECTED TRANSCRIPT"), "corrected.vtt", transcriptId)).status, 200);
     current = await workspace();
     workshop = current.sessions.find((session) => session.id === first.id);
     assert.equal(current.project.active_delivery_id, originalDelivery);
+    assert.deepEqual((await db.query(
+      "SELECT snapshot FROM baseline_versions WHERE project_id=$1 AND version_number=1", [id],
+    )).rows[0].snapshot, baseline, "Editing evidence must not rewrite the accepted baseline");
     assert.ok(current.candidates.every((candidate) => candidate.is_superseded));
     assert.equal(workshop.transcript_filename, "corrected.vtt");
     assert.equal(workshop.transcripts.length, 1);
@@ -952,11 +1235,13 @@ test("workshop transcripts can be saved, corrected and removed without losing wo
     const portable = await post(`/api/projects/${id}/prompts`, { candidate_id: nextCandidate });
     assert.match(portable.prompt, /CORRECTED TRANSCRIPT/);
     assert.match(portable.prompt, /SEPARATE WORKSHOP TRANSCRIPT/);
+    await confirmDecision(base, id, nextCandidate);
     await post(`/api/projects/${id}/approve`, {
-      candidate_id: nextCandidate, delivery_mode: "PLAN", expected_delivery_id: originalDelivery,
+      candidate_id: nextCandidate, delivery_mode: "PLAN", expected_delivery_id: null,
     });
     assert.equal(await readFile(path.join(process.env.MEDIA_DIR, id, "artifacts", originalArtifact), "utf8"), originalContent);
     current = await workspace();
+    await completeDecision(base, id);
     const correctedPath = current.sessions.find((session) => session.id === first.id).transcript_path;
     const videoPath = path.join(process.env.MEDIA_DIR, id, "retained-recording.mp4");
     await writeFile(videoPath, "Recording fixture must not be deleted");

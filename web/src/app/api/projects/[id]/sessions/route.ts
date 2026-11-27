@@ -5,7 +5,7 @@ import { z } from "zod";
 import {
   apiResponse, ApiError, callWorker, projectId, requireSameOrigin, type ProjectRoute,
 } from "@/lib/api";
-import { getDatabase, transaction } from "@/lib/db";
+import { ensureOpenIteration, getDatabase, requireEvidenceEditing, transaction } from "@/lib/db";
 import { projectMedia } from "@/lib/media";
 import { readWorkshopFile } from "@/lib/workshop-files";
 import { insertTranscript, syncWorkshopTranscripts } from "@/lib/workshop-transcripts";
@@ -45,6 +45,8 @@ export async function POST(request: Request, context: ProjectRoute) {
             throw new ApiError(409, "Työpajalle on jo lisätty video.");
           }
         }
+        await requireEvidenceEditing(client, id);
+        await ensureOpenIteration(client, id);
         await mkdir(directory, { recursive: true });
         await writeFile(filename, bytes, { flag: "wx" });
         written = true;

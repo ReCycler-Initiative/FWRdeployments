@@ -115,6 +115,24 @@ details summary { color: #475569; font-size: .85rem; }
 .agenda-slot { display: grid; grid-template-columns: 90px 1fr; gap: 1rem; padding: .85rem; background: #f8fafc; border-radius: .5rem; font-size: .8rem; line-height: 1.65; }
 .agenda-slot time { color: #2563eb; font-size: .72rem; font-weight: 600; padding-top: .1rem; }
 .mock-caption { border-left: 2px solid #fbbf24; padding-left: .6rem; color: #92400e; font-size: .7rem; line-height: 1.6; }
+.workspace-shell .panel { border-radius: .75rem; box-shadow: none; }
+.workspace-shell .project-overview { margin-top: 1.25rem; }
+.next-step { display: flex; justify-content: space-between; align-items: center; gap: 2rem; padding: 1.5rem 1.75rem; margin-bottom: 1.25rem; border: 1px solid #bfdbfe; border-radius: .75rem; background: #eff6ff; }
+.next-step p:not(.eyebrow) { margin-top: .5rem; color: #475569; font-size: .85rem; line-height: 1.6; }
+.next-step .button-primary, .loop-return .button-primary { flex-shrink: 0; }
+.ooda-nav { padding: .5rem; margin-bottom: 1.5rem; background: #edf2fa; border-color: #dbe3ee; }
+.ooda-nav .stage-button { min-height: 76px; padding: 1rem; color: #475569; }
+.ooda-nav .stage-button:hover { background: #fff; }
+.ooda-nav .stage-button[aria-selected="true"] { background: #fff; color: #1d4ed8; border: 1px solid #bfdbfe; }
+.ooda-nav .stage-number { width: 36px; height: 36px; border-radius: .5rem; background: #fff; font-weight: 700; }
+.stage-description { display: block; margin-top: .3rem; font-size: .72rem; font-weight: 400; color: #64748b; }
+.workspace-section-heading, .loop-return { display: flex; align-items: center; justify-content: space-between; gap: 1.5rem; }
+.workspace-section-heading > div, .loop-return > div { min-width: 0; }
+.workspace-section-heading > button { flex-shrink: 0; }
+.workspace-disclosure > summary { font-size: .95rem; font-weight: 600; color: #17253f; min-height: 44px; align-content: center; }
+.workspace-disclosure[open] > summary { margin-bottom: .5rem; }
+.loop-return { border-left: 4px solid #2563eb; }
+.workspace-shell .candidate-card { min-width: 0; }
 @media (max-width: 1000px) { .dashboard-grid { grid-template-columns: 1fr 360px; } .kanban { grid-template-columns: repeat(2, 1fr); } .candidate-grid { grid-template-columns: 1fr; } }
 @media (max-width: 760px) {
   .shell { padding: 1.5rem 1rem; } .topbar { padding-inline: 1rem; gap: 1rem; height: 64px; }
@@ -126,4 +144,9 @@ details summary { color: #475569; font-size: .85rem; }
   .project-overview { grid-template-columns: repeat(2, 1fr); }
   .project-overview > div { padding: .8rem; }
   .agenda-slot { grid-template-columns: 1fr; gap: .2rem; }
+  .next-step, .workspace-section-heading, .loop-return { flex-direction: column; align-items: stretch; gap: 1rem; }
+  .next-step { padding: 1.25rem; }
+  .ooda-nav .stage-button { padding: .75rem; }
+  .ooda-nav .stage-number { width: 28px; height: 28px; }
+  .workspace-shell .button-primary, .workspace-shell .button-secondary { min-height: 44px; }
 }

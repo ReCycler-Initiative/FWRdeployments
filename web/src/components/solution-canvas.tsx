@@ -110,7 +110,8 @@ export function SolutionCanvas({ workspace, refinement, onRefinementChange }: {
       <label>{t("Toteutusprompti")}<textarea value={prompt} readOnly rows={16} aria-label={t("Toteutusprompti")} /></label>
     </div>}
     {view === "artifacts" && <div className="mt-5">{candidate.is_selected
-      ? <Artifacts id={project.id} files={workspace.artifacts} activeDeliveryId={project.active_delivery_id} />
+      ? <Artifacts id={project.id} files={workspace.artifacts} activeDeliveryId={project.active_delivery_id}
+        awaitingDelivery={workspace.iteration?.status === "ACT" && !project.active_delivery_id} />
       : <p className="notice">{t("Tälle kandidaatille ei ole toteutusartefakteja. Hyväksy se ensin tai valitse jo hyväksytty ratkaisu.")}</p>}</div>}
     {error && <p className="error-message mt-4" role="alert">{error}</p>}
     {notice && <p className="notice mt-4" role="status">{notice}</p>}

@@ -20,9 +20,10 @@ export function AgendaContent({ text }: { text: string }) {
   })}</div>;
 }
 
-export function WorkshopPlanner({ id, workshops, enabled, mode, transcriptEnabled, canAnalyze, onSaved }: {
+export function WorkshopPlanner({ id, workshops, enabled, mode, transcriptEnabled, canAnalyze, onSaved, onViewAnalysis }: {
   id: string; workshops: Session[]; enabled: boolean; mode: GenerationMode | null;
   transcriptEnabled: boolean; canAnalyze: boolean; onSaved: () => Promise<unknown>;
+  onViewAnalysis: (sessionId: string) => void;
 }) {
   const { t, locale } = useI18n();
   const timeZone = useBrowserTimeZone();
@@ -62,10 +63,12 @@ export function WorkshopPlanner({ id, workshops, enabled, mode, transcriptEnable
         <p className="subtitle">{t("Yksi projekti, useita keskusteluja. Jokaisella työpajalla on oma tavoite ja runko.")}</p></div>
       <span className="count-label">{workshops.length}</span>
     </div>
-    <div className="notetaker-roadmap mt-5"><span className="roadmap-icon" aria-hidden="true">◉</span>
+    <details className="mt-5"><summary>{t("Notetaker · jatkokehitys")}</summary>
+    <div className="notetaker-roadmap mt-3"><span className="roadmap-icon" aria-hidden="true">◉</span>
       <div><p className="text-sm font-semibold">FRWDeployment Notetaker <span className="future-badge">{t("Tulossa")}</span></p>
-        <p className="mt-1 text-xs leading-5 text-slate-500">{t("Tulevaisuudessa notetaker liittyy sovittuihin työpajoihin. MVP:ssä kokouslinkki on vain suunnittelutieto: tallenna palaveri itse ja lisää aineisto valitulle työpajalle Työpaja-vaiheessa.")}</p></div>
+        <p className="mt-1 text-xs leading-5 text-slate-500">{t("Tulevaisuudessa notetaker liittyy sovittuihin työpajoihin. MVP:ssä kokouslinkki on vain suunnittelutieto: tallenna palaveri itse ja lisää aineisto valitulle työpajalle Havainnoi-näkymässä.")}</p></div>
     </div>
+    </details>
     <button className="button-primary mt-5" disabled={!enabled || !!busy} onClick={() => setCreating(!creating)}>
       {creating ? t("Sulje uuden työpajan lomake") : t("+ Suunnittele työpaja")}</button>
     {creating && <form method="post" className="workshop-create mt-5 space-y-4" onSubmit={create}>
@@ -85,7 +88,10 @@ export function WorkshopPlanner({ id, workshops, enabled, mode, transcriptEnable
           <div className="min-w-0 flex-1"><h3>{workshop.title}</h3>
             <p className="mt-1 text-xs text-slate-500">{workshop.scheduled_at
               ? new Intl.DateTimeFormat(locale === "fi" ? "fi-FI" : "en-GB", { timeZone, dateStyle: "medium", timeStyle: "short" }).format(new Date(workshop.scheduled_at)) : t("Ajankohta sovitaan")}
-              {" · "}{workshop.processed_at ? t("Analysoitu") : workshop.video_path || workshop.transcripts.length ? t("Aineisto lisätty") : workshop.agenda ? t("Runko valmis") : t("Suunnittelussa")}</p>
+              {" · "}{workshop.processed_at ? t("Analysoitu")
+                : workshop.pain_points_json && "error" in workshop.pain_points_json ? t("Analyysivirhe")
+                  : workshop.pain_points_json && "status" in workshop.pain_points_json && workshop.pain_points_json.status === "running" ? t("Analyysi on käynnissä")
+                    : workshop.video_path || workshop.transcripts.length ? t("Odottaa analyysiä") : workshop.agenda ? t("Runko valmis") : t("Suunnittelussa")}</p>
           </div></div>
         {workshop.notes && <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-slate-600">{workshop.notes}</p>}
         <div className="mt-4 flex flex-wrap gap-2">
@@ -94,10 +100,16 @@ export function WorkshopPlanner({ id, workshops, enabled, mode, transcriptEnable
           {workshop.agenda && <button className="button-secondary" onClick={() => setOpenId(openId === workshop.id ? null : workshop.id)}>
             {openId === workshop.id ? t("Sulje työpajarunko") : t("Avaa työpajarunko")}</button>}
           {workshop.meeting_url && <a className="button-secondary" href={workshop.meeting_url} target="_blank" rel="noopener noreferrer">{t("Kokouslinkki ↗")}</a>}
+          {workshop.processed_at && <button className="button-secondary" onClick={() => onViewAnalysis(workshop.id)}>
+            {t("Näytä tämän työpajan analyysi →")}</button>}
         </div>
         {workshop.agenda && <GenerationNotice mode={workshop.agenda_mode} />}
         {openId === workshop.id && workshop.agenda && <div className="mt-5 border-t border-slate-100 pt-5"><AgendaContent text={workshop.agenda} /></div>}
-        <WorkshopTranscript id={id} workshop={workshop} enabled={transcriptEnabled && !busy} canAnalyze={canAnalyze && !busy} onSaved={onSaved} />
+        <details className="mt-4"><summary>{t("Työpajan aineisto ja analyysi")}</summary>
+          <WorkshopTranscript id={id} workshop={workshop} enabled={transcriptEnabled && !busy} canAnalyze={canAnalyze && !busy} onSaved={onSaved} />
+        </details>
+        <p className="field-hint mt-3">{t("Lisätty")} {new Intl.DateTimeFormat(locale === "fi" ? "fi-FI" : "en-GB",
+          { timeZone, dateStyle: "short", timeStyle: "short" }).format(new Date(workshop.created_at))}</p>
       </article>)}
     </div>
   </section>;

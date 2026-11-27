@@ -15,6 +15,7 @@ services:
     volumes:
       - frw_pgdata:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./db/migrations/012_ooda_decisions.sql:/docker-entrypoint-initdb.d/zz-ooda-decisions.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-frw_admin} -d ${POSTGRES_DB:-frwdeployments}"]
       interval: 5s

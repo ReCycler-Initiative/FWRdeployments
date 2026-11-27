@@ -120,7 +120,22 @@ export const candidateSchema = z.object({
   implementation_notes: z.string(),
   implementation_url: z.string().nullable(),
   implementation_updated_at: timestamp,
+  iteration_id: uuid.optional(),
 });
+export const iterationSchema = z.object({
+  id: uuid,
+  project_id: uuid,
+  iteration_number: z.number().int().positive(),
+  status: z.enum(["OBSERVE", "ORIENT", "ACT", "COMPLETED"]),
+  baseline_version_id: uuid,
+  selected_solution_id: uuid.nullable(),
+  decision_rationale: z.string().nullable(),
+  hypothesis: z.string().nullable(),
+  decided_at: timestamp.nullable(),
+  completed_at: timestamp.nullable(),
+  accepted_delivery_id: uuid.nullable(),
+});
+export type Iteration = z.infer<typeof iterationSchema>;
 export const agentTaskSchema = z.object({
   id: uuid,
   project_id: uuid,
@@ -164,6 +179,7 @@ export interface Workspace {
   candidates: SolutionCandidate[];
   tasks: AgentTask[];
   artifacts: Artifact[];
+  iteration: Iteration | null;
 }
 export type StoredWorkspace = Omit<Workspace, "artifacts" | "ai">;
 
@@ -175,4 +191,5 @@ export const workspaceSchema = z.object({
   candidates: z.array(candidateSchema),
   tasks: z.array(agentTaskSchema),
   artifacts: z.array(z.object({ path: z.string(), size: z.number() })),
+  iteration: iterationSchema.nullable(),
 });

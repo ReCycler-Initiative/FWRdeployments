@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 from app.agents.chain import ROLES, mock_output, run_chain
 from app.config import Settings
 from app.ingest import extract_text
-from app.models import OutputSection, RoleOutput, WrittenOutput
+from app.models import OutputSection, RoleOutput, Synthesis, WrittenOutput
 from app.outputs import OUTPUTS, generate_output
 from app.paths import artifact_file
 from app.pipeline.signals import signals
@@ -32,6 +32,8 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         return {
             "project": {**self.context["project"], "id": uuid4(), "language": language},
             "candidate": candidate, "alternatives": [candidate],
+            "decision": {"decision_rationale": "Vastuu varmistettiin asiakkaalta.",
+                         "hypothesis": "Nimeä omistaja ja mittaa siirtoaika."},
             "documents": [{"id": uuid4(), "filename": "Nykytila", "content_text": "Kopiointi vie kaksi tuntia."}],
             "workshops": [
                 {"id": uuid4(), "title": "Työpaja 1", "transcript_vtt": "Omistaja pitää nimetä.", "notes": ""},
@@ -55,6 +57,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("Kopiointi vie kaksi tuntia.", result.content)
                     self.assertIn("Omistaja pitää nimetä.", result.content)
                     self.assertIn("Varmista roolit", result.content)
+                    self.assertIn(context["decision"]["hypothesis"], result.content)
                     self.assertNotIn("DO NOT TREAT MOCK VIDEO", result.content)
                     self.assertIn(f"document:{context['documents'][0]['id']}", result.source_ids)
 
@@ -76,6 +79,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Candidate provenance: mock", result.content)
         self.assertIn("No external research", result.content)
         self.assertEqual(provider.call_args.kwargs["language"], "en")
+        self.assertEqual(provider.call_args.args[3]["decision"], context["decision"])
         self.assertEqual(provider.call_args.args[3]["sources"][1]["text"], "Kopiointi vie kaksi tuntia.")
         self.assertIn("not an instruction prompt", provider.call_args.args[2])
         draft.sections[0].source_ids = ["invented-source"]
@@ -115,15 +119,33 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         settings = self.settings.model_copy(update={"mock_ai": False})
         observations = await signals(settings, uuid4(), {"video_path": "/media/workshop.vtt"}, transcript)
         expected = await synthesize(self.settings, self.context, transcript, observations)
-        with patch("app.pipeline.synthesize.structured", new_callable=AsyncMock, return_value=expected) as provider:
+        payload = expected.model_dump()
+        payload["current_state_mermaid"] = 'graph TD;\n A["Current state"] --> B["Review"];'
+
+        async def response(_settings, model, *_args, **_kwargs):
+            return model.model_validate(payload)
+
+        with patch("app.pipeline.synthesize.structured", new_callable=AsyncMock, side_effect=response) as provider:
             result = await synthesize(settings, self.context, transcript, observations)
-        self.assertIs(result, expected)
+        self.assertEqual(result.model_dump(), payload)
         provider.assert_awaited_once()
         args = provider.call_args.args
         self.assertIn("Do not generate prices", args[2])
         self.assertEqual(args[3]["transcript_vtt"], transcript)
         self.assertEqual(args[3]["documents"], self.context["documents"])
         self.assertEqual(args[3]["signal_fusion"]["signals"], [])
+
+    async def test_synthesis_recognizes_flowchart_aliases_but_rejects_fences_and_other_diagrams(self):
+        observations = await signals(self.settings, uuid4(), {}, "Original workshop evidence")
+        payload = (await synthesize(self.settings, self.context, "Original workshop evidence", observations)).model_dump()
+        for chart in ("flowchart LR\n A --> B", "graph LR\n A --> B", "graph TD; A --> B;"):
+            with self.subTest(chart=chart):
+                result = Synthesis.model_validate({**payload, "current_state_mermaid": chart})
+                self.assertEqual(result.current_state_mermaid, chart)
+        for chart in ("```mermaid\n graph TD; A --> B;\n```", "sequenceDiagram\n A->>B: Hello", "graphical TD"):
+            with self.subTest(chart=chart):
+                with self.assertRaisesRegex(ValueError, "Expected a Mermaid flowchart"):
+                    Synthesis.model_validate({**payload, "current_state_mermaid": chart})
 
     async def test_multiple_active_transcripts_reach_real_synthesis_once_with_local_source_ids(self):
         parts = [
@@ -237,6 +259,18 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
             await run_chain(self.settings, self.context, Path(directory), started, finished)
             self.assertTrue((Path(directory) / "coder" / "prototype.html").is_file())
         self.assertEqual(seen, [(role, status) for role in ROLES for status in ("running", "completed")])
+
+    async def test_agent_provider_receives_confirmed_action_and_output_scope(self):
+        context = {**self.output_context("en"), "refinement": "Limit implementation to one team."}
+        settings = self.settings.model_copy(update={"mock_ai": False})
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("app.agents.chain.structured", new_callable=AsyncMock,
+                       side_effect=[mock_output(role, "en") for role in ROLES]) as provider:
+                await run_chain(settings, context, Path(directory), AsyncMock(), AsyncMock())
+        self.assertEqual(provider.await_count, 4)
+        for call in provider.await_args_list:
+            self.assertEqual(call.args[3]["project"]["decision"], context["decision"])
+            self.assertEqual(call.args[3]["project"]["refinement"], context["refinement"])
 
     def test_artifact_path_and_text_ingestion(self):
         with tempfile.TemporaryDirectory() as directory:

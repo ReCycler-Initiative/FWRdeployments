@@ -58,6 +58,7 @@ async def generate_output(
     data = {
         "project": context["project"], "candidate": candidate,
         "alternatives": context["alternatives"], "sources": sources, "refinement": refinement,
+        "decision": context.get("decision"),
     }
     if len(json.dumps(data, ensure_ascii=False, default=str)) > 200000:
         raise ValueError("Output source material exceeds 200000 characters; reduce the supplied material.")
@@ -152,6 +153,12 @@ async def generate_output(
         + (f" @ {source['revision']}" if source.get("revision") else "")
         for source in sources
     )
+    decision = context.get("decision")
+    decision_text = (
+        "\n\n## " + tr("Vahvistettu päätös", "Confirmed decision") + "\n\n"
+        + tr("Perustelu: ", "Rationale: ") + decision["decision_rationale"] + "\n\n"
+        + tr("Seuraava teko ja onnistumiskriteeri: ", "Next action and success criterion: ") + decision["hypothesis"]
+    ) if decision else ""
     return GeneratedOutput(
         generation_mode="mock" if settings.mock_ai else "ai",
         source_ids=[source["id"] for source in sources],
@@ -161,5 +168,5 @@ async def generate_output(
         + "\n" + tr("Ratkaisuehdotuksen alkuperä: ", "Candidate provenance: ")
         + (candidate.get("generation_mode") or tr("tuntematon", "unknown"))
         + tr(". Ehdotusta ei ole varmennettu faktaksi.\n\n", ". The proposal is not verified as fact.\n\n")
-        + sections + "\n\n## " + tr("Toimitetut lähteet", "Supplied sources") + "\n\n" + appendix,
+        + decision_text + "\n\n" + sections + "\n\n## " + tr("Toimitetut lähteet", "Supplied sources") + "\n\n" + appendix,
     )

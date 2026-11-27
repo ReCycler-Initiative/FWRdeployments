@@ -8,14 +8,16 @@ import { z } from "zod";
 import { requestJson } from "@/lib/client-api";
 import type { Artifact } from "@/lib/types";
 
-export function Artifacts({ id, files, activeDeliveryId }: { id: string; files: Artifact[]; activeDeliveryId: string | null }) {
+export function Artifacts({ id, files, activeDeliveryId, awaitingDelivery = false }: {
+  id: string; files: Artifact[]; activeDeliveryId: string | null; awaitingDelivery?: boolean;
+}) {
   const { t } = useI18n();
 
   const [preview, setPreview] = useState<{ path: string; content: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const url = (file: string) => `/api/projects/${id}/artifacts?path=${encodeURIComponent(file)}`;
-  const current = (file: string) => !activeDeliveryId || file.startsWith(`delivery/${activeDeliveryId}/`);
+  const current = (file: string) => !awaitingDelivery && (!activeDeliveryId || file.startsWith(`delivery/${activeDeliveryId}/`));
   const currentFiles = files.filter((file) => current(file.path));
   const previousFiles = files.filter((file) => !current(file.path));
 

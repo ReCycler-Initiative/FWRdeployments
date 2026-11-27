@@ -3,7 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { apiResponse, ApiError, callWorker, jsonBody, projectId, requireSameOrigin, type ProjectRoute } from "@/lib/api";
-import { getWorkspace, transaction } from "@/lib/db";
+import { getWorkspace, requireActDecision, transaction } from "@/lib/db";
 import { projectMedia } from "@/lib/media";
 import { implementationPlan, implementationPrompt } from "@/lib/prompts";
 import { deliveryModeSchema, generationModeSchema, uuid, type GenerationMode } from "@/lib/types";
@@ -34,13 +34,11 @@ export async function POST(request: Request, context: ProjectRoute) {
         );
         const current = result.rows[0];
         if (!current) throw new ApiError(404, "Projektia ei löytynyt.");
-        if (current.status === "READY_FOR_REVIEW" && current.delivery_mode === input.delivery_mode
-          && current.selected_candidate_id === candidate.id) return;
+        await requireActDecision(client, id, candidate.id);
         if (!["CANDIDATES_READY", "READY_FOR_REVIEW"].includes(current.status)) {
           throw new ApiError(409, "Valintaa voi muuttaa vain valmiiden ratkaisujen tai valmiin toimituksen vaiheessa.");
         }
-        if (current.selected_candidate_id && (input.expected_delivery_id === undefined
-          || input.expected_delivery_id !== current.active_delivery_id)) {
+        if (input.expected_delivery_id === undefined || input.expected_delivery_id !== current.active_delivery_id) {
           throw new ApiError(409, "Valinta on muuttunut tai vahvistus puuttuu. Päivitä työtila ja vahvista muutos uudelleen.");
         }
         const stillExists = await client.query("SELECT id FROM solution_candidates WHERE id=$1 AND project_id=$2 AND NOT is_superseded", [candidate.id, id]);
@@ -76,8 +74,6 @@ export async function POST(request: Request, context: ProjectRoute) {
           await writeFile(filename, file.content, { encoding: "utf-8", flag: "wx" });
           written.push(filename);
         }
-        await client.query("UPDATE solution_candidates SET is_selected=false WHERE project_id=$1", [id]);
-        await client.query("UPDATE solution_candidates SET is_selected=true WHERE id=$1", [candidate.id]);
         await client.query(
           "UPDATE projects SET status='READY_FOR_REVIEW', delivery_mode=$2, active_delivery_id=$3, delivery_generation_mode=$4 WHERE id=$1",
           [id, input.delivery_mode, deliveryId, outputMode],

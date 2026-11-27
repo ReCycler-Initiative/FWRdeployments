@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { PoolClient } from "pg";
 import { ApiError, projectId, requireSameOrigin } from "./api";
-import { transaction } from "./db";
+import { ensureOpenIteration, requireEvidenceEditing, transaction } from "./db";
 import { projectMedia } from "./media";
 import { uuid } from "./types";
 import { readWorkshopFile, removeWorkshopFile } from "./workshop-files";
@@ -75,6 +75,8 @@ export async function changeWorkshopTranscript(request: Request, context: Transc
       if (!status.rows[0]) throw new ApiError(404, "Projektia ei löytynyt.");
       const running = await client.query("SELECT id FROM sessions WHERE project_id=$1 AND pain_points_json->>'status'='running'", [project]);
       if (status.rows[0].status === "BUILDING" || running.rows.length) throw new ApiError(409, "Transkriptiota ei voi muuttaa analyysin tai agenttityön aikana.");
+      await requireEvidenceEditing(client, project);
+      await ensureOpenIteration(client, project);
       const workshop = await client.query("SELECT id FROM sessions WHERE id=$1 AND project_id=$2 FOR UPDATE", [session, project]);
       if (!workshop.rows[0]) throw new ApiError(404, "Työpaja ei kuulu projektiin.");
       let previousPath: string | null = null;

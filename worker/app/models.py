@@ -15,6 +15,7 @@ class AnalyzeRequest(StrictModel):
 class BuildRequest(StrictModel):
     candidate_id: UUID
     expected_delivery_id: UUID | None = None
+    refinement: str = Field(default="", max_length=5000)
 
 
 OutputType = Literal["REPORT", "RECOMMENDATION", "PROCESS", "GUIDE", "EXPERIMENT"]
@@ -70,7 +71,7 @@ class Synthesis(StrictModel):
     @field_validator("current_state_mermaid")
     @classmethod
     def flowchart(cls, value: str) -> str:
-        if not value.strip().startswith("flowchart "):
+        if not value.strip().startswith(("flowchart ", "graph ")):
             raise ValueError("Expected a Mermaid flowchart, without Markdown fences")
         return value
 

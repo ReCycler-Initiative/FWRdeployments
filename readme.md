@@ -63,6 +63,9 @@ Migration 010 adds non-code output types and their persisted generation provenan
 Migration 011 adds multiple named transcripts per workshop and preserves existing
 saved transcripts as individual sources. Generated MP4 transcript caches are not
 mistaken for uploaded originals.
+Migration 012 adds or reconciles the OODA decision tables without replacing
+existing baseline snapshots or locked decisions. Fresh Docker installations run
+it after the initial schema. Upgrade both web and worker together.
 Existing selections, delivery versions and artifacts are not relabeled or replaced.
 Restart the worker and web after upgrading to refresh schema-dependent queries.
 
@@ -82,6 +85,29 @@ the initial server-rendered timestamps use UTC to keep rendering consistent.
 
 ## Workflow
 
+The project UI groups these capabilities into **Havainnoi / Observe**,
+**Ymmärrä / Orient**, **Päätä / Decide** and **Toimi / Act**. This is a repeatable
+OODA loop, not a completion checklist: move freely between views, review the
+suggested next step, record effects in solution tracking and return new feedback
+as workshop evidence. Navigation never triggers AI calls or approval. Existing
+data and delivery history remain intact; MCP is not part of this
+version.
+
+Databases already using OODA iteration tables are supported without resetting
+them: project/workshop creation, recording upload and analysis ensure one open
+iteration under the project lock, using the latest existing baseline. Completed
+decisions and baseline snapshots stay intact. Apply migration 012 to older
+databases; missing baseline data is reported explicitly rather than fabricated.
+
+**Decide is not an output order.** Select a solution proposal, write the rationale
+and next action/success criterion, then confirm. This locks the decision and
+enters ACT without generating a document or starting agents. In **Act**, create
+the documents or optional implementation that support the confirmed solution.
+Changing output types or generating another version does not change the solution.
+Review a ready output and record learning to complete the cycle; a new baseline
+is appended, and a subsequent evidence edit starts the next cycle. Source edits
+and reanalysis are blocked until the current decision cycle is completed.
+
 1. **Create a project:** title, business goal, existing systems and content language.
    The environment supports multiple independent project workspaces.
 2. **Gather context:** paste process descriptions or import TXT, Markdown, CSV,
@@ -100,15 +126,15 @@ the initial server-rendered timestamps use UTC to keep rendering consistent.
    losing the transcript. Existing videos cannot be overwritten by this form.
    Adding VTT/TXT creates an additional named source alongside existing transcripts.
    Identical spoken content in VTT/TXT copies is rejected within the same workshop.
-   Open a workshop's title in **Workshop history** to inspect its details,
-   agenda and transcript controls without leaving the Workshop stage.
+   Use the workshop cards in **Observe** to inspect notes, meeting details and
+   agendas. Expand **Workshop evidence and analysis** for transcript controls.
    **View this workshop's analysis** is a separate, explicit navigation action.
    Each new synthesis considers prior workshops and refreshes current candidates.
    Each workshop lists its named transcripts with individual **Replace transcript**,
    **View transcript** and confirmed **Remove transcript** controls. **Add transcript**
    always adds a source rather than replacing one.
    Saving a VTT/TXT file makes no AI calls: choose **Analyze workshop** separately.
-   You can correct an already held workshop, including after a delivery.
+   You can correct an already held workshop after completing its decision cycle.
    Changes clear that workshop's previous analysis and mark existing proposals
    outdated. Names, notes, agenda, meeting details, other workshops and any video
    are retained. The replaced/removed source file is deleted; earlier immutable
@@ -124,6 +150,8 @@ the initial server-rendered timestamps use UTC to keep rendering consistent.
    the Mermaid current-state process. Compare three candidates by benefits,
    risks, architecture and recorded provenance. Solution prices are not generated
    or displayed. The nullable legacy database cost column is retained for upgrades.
+   Generated Mermaid flowcharts accept both `flowchart` and its `graph` alias,
+   without enclosing Markdown code fences.
 7. **Use the live canvas:** review the relationship between the goal, selected
    outline and delivery path, alongside architecture and emerging artifacts.
    HTML previews are static sandboxed iframes: scripts, network access and form
@@ -140,7 +168,10 @@ the initial server-rendered timestamps use UTC to keep rendering consistent.
    included as original source material, with provenance warnings on analysis.
    ChatGPT-assisted improvement of the solution set before export is a future
    feature, not the current local template refinement; a key alone cannot enable it.
-9. **Approve a candidate and choose an output:**
+9. **Confirm a decision in Decide:** choose a candidate, record why it is the
+   next approach and define the next action and success criterion. Confirmation
+   locks this decision without producing files or starting agents.
+10. **Create a supporting output in Act:**
    - **Report** (default): investigation scope, supplied evidence, information gaps
      and further verification.
    - **Decision recommendation:** alternatives, criteria, conditions and open questions.
@@ -157,18 +188,21 @@ the initial server-rendered timestamps use UTC to keep rendering consistent.
    - **Agent delivery:** an explicit four-stage LangGraph chain
      (`architect → coder → data → qa`) produces reviewable draft artifacts.
      Tasks, logs and canvas refresh every two seconds.
+11. **Review and learn:** review a ready delivery, record the outcome or remaining
+    uncertainty, and complete the cycle. Its decision, accepted delivery and
+    evidence snapshot remain preserved; new evidence starts another iteration.
 
-The final workspace stage is **Outputs**, not an obligatory agent farm.
+The final workspace view is **Act**, not an obligatory agent farm.
 Written outputs, prompts and plans go directly to `READY_FOR_REVIEW`. Agent delivery
-passes through `BUILDING`. Approval stores the current refinements in immutable
-delivery files; subsequent canvas drafts do not replace those accepted exports.
+passes through `BUILDING`. Output creation stores the current refinements in immutable
+delivery files; subsequent canvas drafts do not replace those saved exports.
 Previously accepted files are retained unchanged, including any historical content.
 New prompt/plan exports contain provenance notices and no generated budget section.
 
 ### Written outputs and source boundaries
 
 Reports and the other non-code outputs are standalone Markdown documents, not
-instructions for another coding agent. Preview or download them in **Outputs**.
+instructions for another coding agent. Preview or download them in **Act**.
 In demo mode they are explicitly local template drafts containing excerpts from
 the supplied material. With `MOCK_AI=false`, the worker uses structured OpenAI
 generation and the project content language; this may incur API charges.
@@ -184,7 +218,7 @@ are source metadata, not proof of verification. Even real AI drafts require huma
 source and conclusion review. Unknown owners, deadlines and measured results must
 remain open questions. Adding an API key alone does not produce a verified study.
 
-Output scope/refinements apply to document generation; improving the underlying
+Output scope/refinements apply to document generation and explicit agent runs; improving the underlying
 solution candidate set through conversational ChatGPT remains a future feature.
 Written generation has a 200,000-character serialized input limit and a 110-second
 timeout. Failures are explicit and preserve the previous accepted delivery.

@@ -109,6 +109,16 @@ async def locked_project(connection, project_id: UUID) -> dict:
     return project
 
 
+async def require_act_decision(connection, project_id: UUID, candidate_id: UUID) -> dict:
+    decision = await (await connection.execute(
+        "SELECT * FROM ooda_iterations WHERE project_id=%s AND status='ACT' AND selected_solution_id=%s",
+        (project_id, candidate_id),
+    )).fetchone()
+    if not decision:
+        raise HTTPException(409, "Vahvista tämän ratkaisun päätös Päätä-osiossa ennen tuotoksen tekemistä.")
+    return decision
+
+
 async def attach_transcripts(connection, project_id: UUID, workshops: list[dict]) -> None:
     parts = await (await connection.execute(
         "SELECT id,session_id,title,filename,content FROM workshop_transcripts WHERE project_id=%s ORDER BY created_at,id",
@@ -175,6 +185,7 @@ async def output(project_id: UUID, body: OutputRequest) -> dict:
             raise HTTPException(404, "Project not found")
         if project["status"] not in ("CANDIDATES_READY", "READY_FOR_REVIEW"):
             raise HTTPException(409, "Outputs require current solution candidates")
+        decision = await require_act_decision(connection, project_id, body.candidate_id)
         alternatives = await (await connection.execute(
             """SELECT id, title, summary, benefits, risks, architecture_spec, solution_type, generation_mode
                FROM solution_candidates WHERE project_id=%s AND NOT is_superseded ORDER BY id""", (project_id,),
@@ -196,7 +207,7 @@ async def output(project_id: UUID, body: OutputRequest) -> dict:
         async with asyncio.timeout(110):
             result = await generate_output(settings, {
                 "project": project, "candidate": candidate, "alternatives": alternatives,
-                "documents": documents, "workshops": workshops,
+                "documents": documents, "workshops": workshops, "decision": decision,
             }, body.output_type, body.refinement)
     except HTTPException:
         raise
@@ -262,6 +273,11 @@ async def analyze(project_id: UUID, body: AnalyzeRequest) -> dict:
                 raise HTTPException(404, "Session not found in this project")
             if project["status"] == "BUILDING":
                 raise HTTPException(409, "Transkriptiota ei voi muuttaa analyysin tai agenttityön aikana.")
+            cycle = await (await connection.execute(
+                "SELECT status FROM ooda_iterations WHERE project_id=%s AND status <> 'COMPLETED'", (project_id,),
+            )).fetchone()
+            if not cycle or cycle["status"] == "ACT":
+                raise HTTPException(409, "Katselmoi tuotos ja päätä nykyinen kierros ennen uutta analyysiä.")
             active = await (await connection.execute(
                 """SELECT id FROM sessions WHERE project_id = %s
                    AND pain_points_json->>'status' = 'running'""", (project_id,)
@@ -285,6 +301,9 @@ async def analyze(project_id: UUID, body: AnalyzeRequest) -> dict:
                    current_state_mermaid = NULL, analysis_mode = NULL WHERE id = %s""",
                 (Jsonb({"status": "running"}), body.session_id),
             )
+            await connection.execute(
+                "UPDATE ooda_iterations SET status='ORIENT' WHERE project_id=%s AND status='OBSERVE'", (project_id,),
+            )
     enqueue(analysis_job(project_id, body.session_id, session, context))
     return ACCEPTED
 
@@ -297,8 +316,13 @@ class ContextFileRequest(BaseModel):
 async def extract_context(project_id: UUID, body: ContextFileRequest) -> dict:
     async with pool.connection() as connection:
         project = await locked_project(connection, project_id)
-        if project["status"] not in ("PREPARATION", "CANDIDATES_READY"):
+        if project["status"] not in ("PREPARATION", "CANDIDATES_READY", "READY_FOR_REVIEW"):
             raise HTTPException(409, "Taustamateriaaleja ei voi lisätä käsittelyn aikana.")
+        decided = await (await connection.execute(
+            "SELECT id FROM ooda_iterations WHERE project_id=%s AND status='ACT'", (project_id,),
+        )).fetchone()
+        if decided:
+            raise HTTPException(409, "Kierroksen päätös on vahvistettu. Katselmoi tuotos ja päätä kierros Toimi-osiossa ennen aineiston muuttamista.")
     try:
         path = project_file(settings.media_dir, project_id, body.path)
         text = await asyncio.wait_for(asyncio.to_thread(extract_text, path), timeout=30)
@@ -378,9 +402,10 @@ async def build(project_id: UUID, body: BuildRequest) -> dict:
             )).fetchone()
             if not candidate:
                 raise HTTPException(404, "Candidate not found in this project")
+            decision = await require_act_decision(connection, project_id, body.candidate_id)
             if candidate["is_superseded"]:
                 raise HTTPException(409, "Ratkaisun lähdeaineisto on muuttunut. Päivitä analyysi ja valitse ajantasainen ehdotus.")
-            if project["status"] in ("BUILDING", "READY_FOR_REVIEW") and candidate["is_selected"] and project["delivery_mode"] == "AGENTS":
+            if project["status"] == "BUILDING" and candidate["is_selected"] and project["delivery_mode"] == "AGENTS":
                 return ACCEPTED
             if project["status"] not in ("CANDIDATES_READY", "READY_FOR_REVIEW"):
                 raise HTTPException(409, "Valintaa voi muuttaa vain valmiiden ratkaisujen tai valmiin toimituksen vaiheessa.")
@@ -395,6 +420,8 @@ async def build(project_id: UUID, body: BuildRequest) -> dict:
             real_config()
             context = await context_for(connection, project)
             context["candidate"] = candidate
+            context["decision"] = decision
+            context["refinement"] = body.refinement
             delivery_id = uuid4()
             await connection.execute(
                 "UPDATE solution_candidates SET is_selected = false WHERE project_id = %s", (project_id,)

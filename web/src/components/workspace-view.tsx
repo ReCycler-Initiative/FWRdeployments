@@ -15,12 +15,17 @@ import { Artifacts } from "./artifacts";
 import { SourceImport } from "./source-import";
 import { SolutionCanvas } from "./solution-canvas";
 import { ImplementationTracker, implementationLabels, solutionTypeLabels } from "./implementation-tracker";
-import { AgendaContent, WorkshopPlanner } from "./workshop-planner";
+import { WorkshopPlanner } from "./workshop-planner";
 import { AiModeNotice, GenerationNotice } from "./ai-notice";
 import { WorkshopTranscript } from "./workshop-transcript";
 import { DeleteProject } from "./delete-project";
 
-const stages = ["Valmistelu", "Työpaja", "Ratkaisut", "Tuotokset"];
+const stages = [
+  { label: "Havainnoi", name: "Observe", description: "Aineisto ja työpajat" },
+  { label: "Ymmärrä", name: "Orient", description: "Tilannekuva ja tulkinnat" },
+  { label: "Päätä", name: "Decide", description: "Vaihtoehdot ja hyväksyntä" },
+  { label: "Toimi", name: "Act", description: "Tuotokset ja vaikutukset" },
+];
 const roleLabels = { architect: "Arkkitehti", coder: "Koodaus", data: "Data", qa: "Testaus" };
 const taskLabels = { pending: "Odottaa vuoroaan", running: "Työn alla", completed: "Valmis", failed: "Epäonnistui" };
 const deliveryLabels: Record<DeliveryMode, string> = {
@@ -33,7 +38,6 @@ const deliveryLabels: Record<DeliveryMode, string> = {
   PLAN: "Toteutussuunnitelma – ei automaattista koodausta",
   AGENTS: "Agenttitoteutus – arkkitehti, koodaus, data ja QA",
 };
-type ApprovalChoice = { candidateId: string; deliveryMode: DeliveryMode; expectedDeliveryId: string | null; refinement: string };
 const clock = (seconds: number) => `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`;
 
 export function WorkspaceView({ initial }: { initial: Workspace }) {
@@ -41,39 +45,59 @@ export function WorkspaceView({ initial }: { initial: Workspace }) {
   const timeZone = useBrowserTimeZone();
 
   const [workspace, setWorkspace] = useState(initial);
-  const [stage, setStage] = useState(statusStages[initial.project.status]);
+  const [stage, setStage] = useState(initial.iteration?.status === "ACT" ? 3 : statusStages[initial.project.status]);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pollError, setPollError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [viewedSessionId, setViewedSessionId] = useState<string | null>(null);
-  const [openWorkshopId, setOpenWorkshopId] = useState<string | null>(null);
   const [uploadSessionId, setUploadSessionId] = useState("");
   const [deliveryMode, setDeliveryMode] = useState<DeliveryMode>(initial.project.delivery_mode ?? "REPORT");
-  const [pendingChoice, setPendingChoice] = useState<ApprovalChoice | null>(null);
-  const confirmation = useRef<HTMLDialogElement>(null);
+  const [draftCandidateId, setDraftCandidateId] = useState<string | null>(null);
+  const [decisionRationale, setDecisionRationale] = useState("");
+  const [hypothesis, setHypothesis] = useState("");
+  const [feedback, setFeedback] = useState("");
+  const tabs = useRef<Array<HTMLButtonElement | null>>([]);
   const [refinement, setRefinement] = useState("");
   const id = workspace.project.id;
   const base = `/api/projects/${id}`;
-  const { project, documents, sessions, candidates, tasks } = workspace;
-  const selectedCandidate = candidates.find((candidate) => candidate.is_selected);
-  const canApprove = project.status === "CANDIDATES_READY" || project.status === "READY_FOR_REVIEW";
+  const { project, documents, sessions, candidates, tasks, iteration } = workspace;
+  const selectedCandidate = candidates.find((candidate) => candidate.id === iteration?.selected_solution_id)
+    ?? candidates.find((candidate) => candidate.is_selected);
+  const draftCandidate = candidates.find((candidate) => candidate.id === draftCandidateId);
+  const decisionLocked = iteration?.status === "ACT";
   const demo = workspace.ai.status === "available" && workspace.ai.mode === "mock";
-  const currentStage = statusStages[project.status];
+  const currentCandidates = candidates.filter((candidate) => !candidate.is_superseded);
   const uploadedSessions = sessions.filter((session) => session.video_path || session.transcripts.length);
   const uploadWorkshop = sessions.find((workshop) => workshop.id === uploadSessionId);
-  const session = uploadedSessions.find((session) => session.id === viewedSessionId) ?? uploadedSessions[0];
-  const latest = uploadedSessions[0];
-  const analysisError = latest?.pain_points_json && "error" in latest.pain_points_json
-    ? latest.pain_points_json.error : null;
+  const pendingSession = uploadedSessions.find((session) => !session.processed_at);
+  const session = uploadedSessions.find((session) => session.id === viewedSessionId) ?? pendingSession ?? uploadedSessions[0];
   const points = Array.isArray(session?.pain_points_json) ? session.pain_points_json : [];
   const failedTask = tasks.find((task) => task.status === "failed");
-  const preparing = project.status === "PREPARATION" || project.status === "CANDIDATES_READY";
+  const preparing = !decisionLocked && ["PREPARATION", "CANDIDATES_READY", "READY_FOR_REVIEW"].includes(project.status);
   const analysisRunning = sessions.some((session) => session.pain_points_json
     && "status" in session.pain_points_json && session.pain_points_json.status === "running");
   const polling = (project.status === "BUILDING" && !failedTask) || analysisRunning;
-  const transcriptEnabled = project.status !== "BUILDING" && !analysisRunning && !busy;
-  const canAnalyze = project.status !== "BUILDING" && !analysisRunning && !busy;
+  const transcriptEnabled = project.status !== "BUILDING" && !decisionLocked && !analysisRunning && !busy;
+  const canAnalyze = transcriptEnabled;
+  const canDecide = !!iteration && !decisionLocked && !analysisRunning
+    && ["CANDIDATES_READY", "READY_FOR_REVIEW"].includes(project.status);
+  const canCreateOutput = decisionLocked && !!selectedCandidate && !selectedCandidate.is_superseded
+    && !analysisRunning && ["CANDIDATES_READY", "READY_FOR_REVIEW"].includes(project.status);
+  const suggestedStage = decisionLocked || failedTask || project.status === "BUILDING" ? 3
+    : analysisRunning || pendingSession ? 1
+      : iteration && currentCandidates.some((candidate) => candidate.iteration_id === iteration.id) ? 2 : 0;
+  const nextStep = suggestedStage === 1
+    ? analysisRunning ? "Analyysi kokoaa tilannekuvaa" : "Muodosta aineistosta tilannekuva"
+    : suggestedStage === 2 ? "Vertaa vaihtoehtoja ja valitse seuraava teko"
+      : suggestedStage === 3 ? failedTask ? "Tarkista toteutuksen virhe"
+        : decisionLocked && !project.active_delivery_id ? "Laadi päätöstä tukeva tuotos" : "Katselmoi tuotos ja kirjaa vaikutukset"
+        : "Kokoa havainnot yhteiseen työtilaan";
+
+  function navigateStage(index: number) {
+    setStage(index);
+    tabs.current[index]?.focus();
+  }
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
     const next = await requestJson(base, { signal }, workspaceSchema);
@@ -81,11 +105,6 @@ export function WorkspaceView({ initial }: { initial: Workspace }) {
     setPollError(null);
     return next;
   }, [base]);
-
-  useEffect(() => {
-    if (pendingChoice) confirmation.current?.showModal();
-    else confirmation.current?.close();
-  }, [pendingChoice]);
 
   useEffect(() => {
     if (!polling) return;
@@ -110,6 +129,8 @@ export function WorkspaceView({ initial }: { initial: Workspace }) {
       if (nextStage !== undefined) setStage(nextStage);
       setNotice(name === "agenda" ? t("Työpajarunko on tallennettu.") : name === "context" ? t("Taustamateriaali on tallennettu.")
         : name === "upload" ? t("Työpajan aineisto on tallennettu. Käynnistä analyysi työpajan tiedoista.")
+          : name === "decision" ? t("Päätös on vahvistettu. Tuotoksia tai agenttityötä ei vielä käynnistetty.")
+            : name === "complete" ? t("Kierros on päätetty ja katselmointi tallennettu uutena baselinena.")
           : nextStage === 3 && next.project.status === "READY_FOR_REVIEW" ? t("Valittu tuotos on valmis katselmoitavaksi.") : t("Työnkulku on käynnistetty."));
     } catch (error) {
       setError(error instanceof Error ? error.message : t("Toiminto epäonnistui."));
@@ -141,47 +162,38 @@ export function WorkspaceView({ initial }: { initial: Workspace }) {
     await mutate("upload", async () => {
       const saved = await requestJson(url, { method: "POST", body: data }, z.object({ session_id: z.string() }));
       setViewedSessionId(saved.session_id);
-      setOpenWorkshopId(saved.session_id);
       form.reset();
     }, 1);
   }
 
-  async function submitChoice(choice: ApprovalChoice) {
-    setPendingChoice(null);
-    await mutate(choice.candidateId, () => requestJson(`${base}/${choice.deliveryMode === "AGENTS" ? "build" : "approve"}`,
+  async function confirmDecision(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!draftCandidate || !iteration) { setError(t("Valitse tämän kierroksen ajantasainen ratkaisuehdotus.")); return; }
+    await mutate("decision", () => requestJson(`${base}/decision`, postJson({
+      candidate_id: draftCandidate.id, expected_iteration_id: iteration.id,
+      decision_rationale: decisionRationale, hypothesis,
+    }), z.unknown()), 3);
+  }
+
+  async function createOutput(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedCandidate || !decisionLocked) { setError(t("Vahvista tämän ratkaisun päätös Päätä-osiossa ennen tuotoksen tekemistä.")); return; }
+    await mutate("output", () => requestJson(`${base}/${deliveryMode === "AGENTS" ? "build" : "approve"}`,
       postJson({
-        candidate_id: choice.candidateId, expected_delivery_id: choice.expectedDeliveryId,
-        ...(choice.deliveryMode === "AGENTS" ? {} : { delivery_mode: choice.deliveryMode, refinement: choice.refinement }),
+        candidate_id: selectedCandidate.id, expected_delivery_id: project.active_delivery_id, refinement,
+        ...(deliveryMode === "AGENTS" ? {} : { delivery_mode: deliveryMode }),
       }), z.unknown()), 3);
   }
 
-  function choose(candidateId: string) {
-    const choice = { candidateId, deliveryMode, expectedDeliveryId: project.active_delivery_id, refinement };
-    if (selectedCandidate) setPendingChoice(choice);
-    else void submitChoice(choice);
+  async function completeCycle(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!iteration || !project.active_delivery_id) { setError(t("Katselmoi nykyinen valmis tuotos ennen kierroksen päättämistä.")); return; }
+    await mutate("complete", () => requestJson(`${base}/complete`, postJson({
+      expected_iteration_id: iteration.id, expected_delivery_id: project.active_delivery_id, feedback,
+    }), z.unknown()), 0);
   }
 
-  return <main className="shell">
-    <dialog ref={confirmation} className="panel selection-dialog" aria-labelledby="selection-confirm-title"
-      onCancel={() => setPendingChoice(null)}>
-      {pendingChoice && <div className="space-y-5">
-        <h2 id="selection-confirm-title">{t("Vahvista valinnan muutos")}</h2>
-        <p><strong>{t("Nykyinen valinta:")}</strong> {selectedCandidate?.title}</p>
-        <p><strong>{t("Uusi valinta:")}</strong> {candidates.find((candidate) => candidate.id === pendingChoice.candidateId)?.title}</p>
-        <p><strong>{t("Lopputulos:")}</strong> {t(deliveryLabels[pendingChoice.deliveryMode])}</p>
-        <p className="notice">{t("Aiemmat toimitustiedostot ja toteutuksen seurantatiedot säilyvät. Uusi valinta luo uuden toimituksen, eikä peruuta ulkoisissa työkaluissa tehtyä työtä.")}</p>
-        {pendingChoice.deliveryMode === "AGENTS" && <p className="field-hint">{demo
-          ? t("Vahvistus käynnistää uuden simuloidun agenttiketjun.")
-          : t("Vahvistus käynnistää uuden agenttiketjun ja voi tehdä maksullisia API-kutsuja.")}</p>}
-        {isWrittenOutput(pendingChoice.deliveryMode) && <p className="field-hint">{demo
-          ? t("Vahvistus luo aineisto-otteita sisältävän demoluonnoksen, ei varmennettua selvitystä.")
-          : t("Vahvistus generoi AI-luonnoksen OpenAI API:lla ja voi tehdä maksullisia API-kutsuja. Ulkoista tiedonhakua ei tehdä.")}</p>}
-        <div className="flex flex-wrap gap-3">
-          <button type="button" className="button-secondary" onClick={() => setPendingChoice(null)}>{t("Peruuta")}</button>
-          <button type="button" className="button-primary" onClick={() => void submitChoice(pendingChoice)}>{t("Vahvista ja vaihda valinta")}</button>
-        </div>
-      </div>}
-    </dialog>
+  return <main className="shell workspace-shell">
     <Link href="/" className="text-sm text-slate-500">{t("← Kaikki projektit")}</Link>
     <header className="page-heading mt-6">
       <div><p className="eyebrow">{t("FRWDeployments-projektityötila")}</p><h1>{project.title}</h1>
@@ -202,13 +214,30 @@ export function WorkspaceView({ initial }: { initial: Workspace }) {
       <div><span className="overview-number">{candidates.length}</span><span>{t("ratkaisuvaihtoehtoa")}</span></div>
       <div><span className="overview-number">{workspace.artifacts.length}</span><span>{t("katselmoitavaa tuotosta")}</span></div>
     </div>
-    <div className="stage-nav" role="tablist" aria-label={t("Projektin vaiheet")}>
-      {stages.map((label, index) => <button key={label} type="button" role="tab"
+    <section className="next-step" aria-labelledby="next-step-title">
+      <div><p className="eyebrow">{t("Seuraava hyödyllinen askel")}</p>
+        <h2 id="next-step-title">{t(nextStep)}</h2>
+        <p>{t("Ihminen päättää. AI auttaa jäsentämään. Voit palata havaintoihin milloin tahansa.")}</p>
+      </div>
+      <button type="button" className="button-primary" onClick={() => navigateStage(suggestedStage)}>
+        {t(stages[suggestedStage].label)} <span aria-hidden="true">→</span>
+      </button>
+    </section>
+    <div className="stage-nav ooda-nav" role="tablist" aria-label={t("OODA-työtila")}>
+      {stages.map(({ label, name, description }, index) => <button key={name} type="button" role="tab"
+        ref={(element) => { tabs.current[index] = element; }}
+        tabIndex={stage === index ? 0 : -1}
         aria-selected={stage === index} aria-controls={`stage-${index}`} id={`tab-${index}`}
-        className={`stage-button ${index < currentStage ? "stage-complete" : ""}`}
-        onClick={() => setStage(index)}>
-        <span className="stage-number" aria-hidden="true">{index < currentStage ? "✓" : index}</span>
-        <span>{index}. {t(label)}{index === currentStage && <span className="block text-[.65rem] font-normal">{t("Nykyinen vaihe")}</span>}</span>
+        className="stage-button"
+        onClick={() => setStage(index)}
+        onKeyDown={(event) => {
+          const next = event.key === "ArrowRight" ? (index + 1) % stages.length
+            : event.key === "ArrowLeft" ? (index + stages.length - 1) % stages.length
+              : event.key === "Home" ? 0 : event.key === "End" ? stages.length - 1 : null;
+          if (next !== null) { event.preventDefault(); navigateStage(next); }
+        }}>
+        <span className="stage-number" aria-hidden="true">{name[0]}</span>
+        <span><strong>{t(label)}</strong><span className="stage-description">{t(description)}</span></span>
       </button>)}
     </div>
     {error && <p className="error-message mb-5" role="alert">{error}</p>}
@@ -216,10 +245,18 @@ export function WorkspaceView({ initial }: { initial: Workspace }) {
       <button className="ml-4 underline" onClick={() => void mutate("refresh", () => refresh())}>{t("Päivitä nyt")}</button></div>}
     {notice && <p className="notice mb-5" role="status">{notice}</p>}
 
-    {stage === 0 && <section id="stage-0" role="tabpanel" aria-labelledby="tab-0" className="workspace-grid">
+    {stage === 0 && <section id="stage-0" role="tabpanel" aria-labelledby="tab-0" className="space-y-6">
+      {decisionLocked && <p className="notice">{t("Kierroksen päätös on vahvistettu. Katselmoi tuotos ja päätä kierros Toimi-osiossa ennen aineiston muuttamista.")}</p>}
+      <div className="workspace-section-heading"><div><p className="eyebrow">Observe</p>
+        <h2>{t("Yhteinen tietopohja")}</h2><p className="subtitle">{t("Lisää aineistoa, suunnittele keskustelu tai tuo uuden kokeilun havainnot. Tallennus ei käynnistä analyysiä.")}</p></div>
+        <button className="button-secondary" onClick={() => navigateStage(1)}>{t("Muodosta tilannekuva →")}</button>
+      </div>
+      <div className="workspace-grid">
       <div className="space-y-5">
-        <form method="post" className="panel space-y-5" onSubmit={addContext}>
-          <div><p className="eyebrow">{t("Vaihe 0 · Yhteinen lähtötilanne")}</p><h2>{t("Taustamateriaalit ja prosessikuvaukset")}</h2>
+        <details className="panel workspace-disclosure" open={documents.length === 0}>
+          <summary>{t("Lisää taustamateriaalia")}</summary>
+        <form method="post" className="mt-5 space-y-5" onSubmit={addContext}>
+          <div><h2>{t("Taustamateriaalit ja prosessikuvaukset")}</h2>
             <p className="subtitle">{t("Liitä nykytilan kuvaus, tavoitteet tai tärkeimmät kipupisteet tekstinä, tiedostoina tai GitHub-lähteenä.")}</p></div>
           <label>{t("Materiaalin nimi")}<input name="filename" required maxLength={200} placeholder={t("Esim. asiakaspalautteen nykyprosessi")} disabled={!preparing} /></label>
           <label>{t("Materiaalin sisältö")}<textarea name="content_text" required maxLength={100000} rows={7} placeholder={t("Liitä dokumentin teksti tähän…")} disabled={!preparing} /></label>
@@ -227,6 +264,7 @@ export function WorkspaceView({ initial }: { initial: Workspace }) {
           {!preparing && <p className="field-hint">{t("Valmistelu on lukittu analyysin ja toteutuksen ajaksi.")}</p>}
         </form>
         <SourceImport id={id} enabled={preparing && !busy} onSaved={() => refresh()} />
+        </details>
         <section className="panel"><h2>{t("Liitetyt materiaalit")} <span className="text-slate-400">({documents.length})</span></h2>
           {!documents.length && <p className="subtitle">{t("Taustamateriaaleja ei ole vielä lisätty.")}</p>}
           <div className="mt-4 space-y-4">{documents.map((document) => <details key={document.id}>
@@ -238,12 +276,14 @@ export function WorkspaceView({ initial }: { initial: Workspace }) {
       </div>
       <WorkshopPlanner id={id} workshops={sessions} enabled={preparing && !busy}
         mode={workspace.ai.status === "available" ? workspace.ai.mode : null}
-        transcriptEnabled={!!transcriptEnabled} canAnalyze={!!canAnalyze} onSaved={() => refresh()} />
-    </section>}
+        transcriptEnabled={!!transcriptEnabled} canAnalyze={!!canAnalyze} onSaved={() => refresh()}
+        onViewAnalysis={(sessionId) => { setViewedSessionId(sessionId); navigateStage(1); }} />
+      </div>
 
-    {stage === 1 && <section id="stage-1" role="tabpanel" aria-labelledby="tab-1" className="workspace-grid">
-      <form method="post" className="panel space-y-5" onSubmit={upload}>
-        <div><p className="eyebrow">{t("Vaihe 1 · Havainnointi")}</p><h2>{t("Lisää työpajatallenne tai litterointi")}</h2>
+      <details className="panel workspace-disclosure" open={uploadedSessions.length === 0}>
+        <summary>{t("Lisää työpajatallenne tai litterointi")}</summary>
+      <form method="post" className="mt-5 space-y-5" onSubmit={upload}>
+        <div><h2>{t("Lisää työpajatallenne tai litterointi")}</h2>
           <p className="subtitle">{t("Voit pitää useita työpajoja. Historiatiedot säilyvät, ja uusi analyysi yhdistää nykyisen työpajan aiempiin havaintoihin ennen kandidaattien päivittämistä.")}</p></div>
         <label>{t("Työpaja, johon aineisto lisätään")}<select name="session_id" value={uploadSessionId}
           onChange={(event) => setUploadSessionId(event.target.value)} disabled={!transcriptEnabled}>
@@ -263,48 +303,25 @@ export function WorkspaceView({ initial }: { initial: Workspace }) {
         <button className="button-primary" disabled={!transcriptEnabled}>{busy === "upload" ? t("Tallennetaan…")
           : uploadSessionId ? t("Lisää aineisto työpajalle") : t("Lisää työpaja ja aineisto")}</button>
       </form>
-      <section className="panel"><p className="eyebrow">{t("Analyysin tila")}</p><h2>{t("Puheesta ratkaisuvaihtoehdoiksi")}</h2>
-        {!session && <p className="notice mt-5">{t("Lisää ensimmäinen työpajatallenne tai litterointi.")}</p>}
-        {analysisRunning && <p className="notice mt-5" role="status">{t("Analyysi on käynnissä. Tila päivittyy automaattisesti 2 sekunnin välein.")}</p>}
-        {project.status === "WORKSHOP_UPLOADED" && !analysisRunning && !analysisError && <p className="notice mt-5">{t("Aineisto odottaa analyysiä. Valitse työpajan kohdalta Analysoi työpaja päivittääksesi ratkaisukokonaisuuden.")}</p>}
-        {analysisError && <div className="mt-5 space-y-4"><p className="error-message" role="alert">{t("Analyysi epäonnistui:")} {analysisError}</p>
-          <button className="button-secondary" disabled={!!busy} onClick={() => void mutate("analyze",
-            () => requestJson(`${base}/analyze`, postJson({ session_id: latest.id }), z.unknown()))}>{t("Yritä analyysia uudelleen")}</button></div>}
-        {latest?.processed_at && !analysisError && <div className="mt-5"><GenerationNotice mode={latest.analysis_mode} />
-          <p className="notice">{latest.analysis_mode === "mock" ? t("Demoanalyysi valmis. Näytetään esimerkkikipupisteet, esimerkkikaavio ja esimerkkiratkaisut.") : t("Analyysi valmis. Kipupistekartta, nykytilakaavio ja ratkaisukandidaatit ovat arvioitavana.")}</p>
-          <button className="button-primary mt-5" onClick={() => setStage(2)}>{t("Siirry ratkaisuihin →")}</button></div>}
-        <ol className="mt-6 space-y-3 text-sm text-slate-500"><li>{t("1. Litterointi ja kontekstin kokoaminen")}</li><li>{t("2. Aikaleimatut havainnot ja signaalifuusio")}</li><li>{t("3. Nykytila ja vaihtoehtoiset ratkaisukandidaatit")}</li></ol>
-      </section>
-      <section className="panel md:col-span-2"><h2>{t("Työpajahistoria (")}{sessions.length})</h2>
-        <div className="mt-4 space-y-3">{sessions.map((workshop) => <article className="workshop-card" key={workshop.id}><div className="artifact-row">
-          <button type="button" aria-expanded={openWorkshopId === workshop.id} aria-controls={`workshop-${workshop.id}`}
-            onClick={() => setOpenWorkshopId(openWorkshopId === workshop.id ? null : workshop.id)}>{workshop.title}</button>
-          <span>{workshop.processed_at ? t("Analysoitu") : !workshop.video_path && !workshop.transcripts.length ? t("Suunniteltu")
-            : workshop.pain_points_json && "error" in workshop.pain_points_json ? t("Analyysivirhe")
-            : workshop.pain_points_json && "status" in workshop.pain_points_json && workshop.pain_points_json.status === "running"
-              ? t("Analyysi on käynnissä") : t("Odottaa analyysiä")} · {new Intl.DateTimeFormat(locale === "fi" ? "fi-FI" : "en-GB", { timeZone, dateStyle: "short", timeStyle: "short" }).format(new Date(workshop.created_at))}</span>
-        </div>{openWorkshopId === workshop.id && <div id={`workshop-${workshop.id}`} className="mt-4 space-y-4"
-          role="region" aria-label={`${t("Työpajan tiedot:")} ${workshop.title}`}>
-          {workshop.notes && <p className="whitespace-pre-wrap text-sm">{workshop.notes}</p>}
-          {workshop.scheduled_at && <p className="field-hint">{new Intl.DateTimeFormat(locale === "fi" ? "fi-FI" : "en-GB",
-            { timeZone, dateStyle: "medium", timeStyle: "short" }).format(new Date(workshop.scheduled_at))}</p>}
-          {workshop.meeting_url && <a className="button-secondary" href={workshop.meeting_url}
-            target="_blank" rel="noopener noreferrer">{t("Kokouslinkki ↗")}</a>}
-          {workshop.agenda && <details><summary>{t("Työpajarunko")}</summary><GenerationNotice mode={workshop.agenda_mode} />
-            <AgendaContent text={workshop.agenda} /></details>}
-          <WorkshopTranscript id={id} workshop={workshop} enabled={!!transcriptEnabled} canAnalyze={!!canAnalyze} onSaved={() => refresh()} />
-          {workshop.processed_at && <button className="button-secondary"
-            onClick={() => { setViewedSessionId(workshop.id); setStage(2); }}>{t("Näytä tämän työpajan analyysi →")}</button>}
-        </div>}</article>)}</div>
-      </section>
+      </details>
     </section>}
 
-    {stage === 2 && <section id="stage-2" role="tabpanel" aria-labelledby="tab-2" className="space-y-6">
-      <div><p className="eyebrow">{t("Vaihe 2 · Ihminen päättää")}</p><h2>{t("Kipupisteet, nykytila ja ratkaisuvaihtoehdot")}</h2>
+    {stage === 1 && <section id="stage-1" role="tabpanel" aria-labelledby="tab-1" className="space-y-6">
+      <div className="workspace-section-heading"><div><p className="eyebrow">Orient</p><h2>{t("Ymmärrä tilanne ennen päätöstä")}</h2>
         <p className="subtitle">{t("Signaalit ovat tulkinnan tukena, eivät todisteita osallistujien tunteista. Varmista havainnot yhdessä asiakkaan kanssa.")}</p></div>
+        <button className="button-secondary" onClick={() => navigateStage(0)}>{t("Täydennä havaintoja")}</button>
+      </div>
+      {analysisRunning && <p className="notice" role="status">{t("Analyysi on käynnissä. Tila päivittyy automaattisesti 2 sekunnin välein.")}</p>}
+      {!session && <div className="panel empty-state"><h2>{t("Tilannekuva alkaa havainnoista")}</h2>
+        <p>{t("Lisää ensimmäinen työpajatallenne tai litterointi.")}</p>
+        <button className="button-primary mt-5" onClick={() => navigateStage(0)}>{t("Lisää aineistoa")}</button></div>}
       {uploadedSessions.length > 0 && <label>{t("Katselmoitava työpaja")}<select value={session?.id ?? ""} onChange={(event) => setViewedSessionId(event.target.value)}>
         {uploadedSessions.map((workshop) => <option key={workshop.id} value={workshop.id}>{workshop.title} · {workshop.processed_at ? t("Analysoitu") : t("Kesken")}</option>)}
       </select></label>}
+      {session && !session.processed_at && <section className="panel">
+        <h2>{session.title}</h2><p className="subtitle">{t("Käynnistä analyysi, kun aineisto on valmis. AI:n tulkinnat katselmoidaan ennen päätöstä.")}</p>
+        <WorkshopTranscript id={id} workshop={session} enabled={!!transcriptEnabled} canAnalyze={!!canAnalyze} onSaved={() => refresh()} />
+      </section>}
       {!session?.processed_at
         ? <p className="notice">{t("Tämän työpajan tulokset tulevat näkyviin analyysin valmistuttua.")}</p>
         : <>
@@ -328,32 +345,31 @@ export function WorkspaceView({ initial }: { initial: Workspace }) {
             </section>
           </div>
         </>}
-        {candidates.length > 0 && <>
-          <SolutionCanvas workspace={workspace} refinement={refinement} onRefinementChange={setRefinement} />
-          {candidates.filter((candidate) => candidate.is_selected).map((candidate) =>
-            <ImplementationTracker key={candidate.id} id={id} candidate={candidate}
-              locked={project.status === "BUILDING"} onSaved={() => refresh()} />)}
-          <section className="panel space-y-4"><div><p className="eyebrow">{t("Ratkaisu ei edellytä koodausta")}</p><h2>{t("Valitse lopputulos")}</h2>
-            <p className="subtitle">{t("Lopputulos voi olla selvitys, suositus, toimintamalli, ohjeistus tai kokeilusuunnitelma. Valitse ohjelmistototeutus vain tarvittaessa.")}</p></div>
-            {selectedCandidate && <p className="notice"><strong>{t("Nykyinen valinta:")}</strong> {selectedCandidate.title}<br />
-              {canApprove ? t("Voit vertailla muita vaihtoehtoja ja vaihtaa ratkaisua tai lopputulosta vahvistamalla uuden valinnan.")
-                : t("Vaihtoehtoja voi katsella, mutta valinnan muuttaminen on estetty BUILDING-vaiheessa.")}</p>}
-            <label>{t("Valitse tuotos")}<select value={deliveryMode} disabled={!canApprove || !!busy}
-              onChange={(event) => setDeliveryMode(deliveryModeSchema.parse(event.target.value))}>
-              {Object.entries(deliveryLabels).map(([value, label]) => <option key={value} value={value}>{t(label)}</option>)}
-            </select></label>
-            {isWrittenOutput(deliveryMode) ? <>
-              <label>{t("Tuotoksen rajaus tai tarkennukset")}<textarea rows={3} maxLength={5000} value={refinement}
-                onChange={(event) => setRefinement(event.target.value)} disabled={!canApprove || !!busy} /></label>
-              <p className="notice">{demo
-                ? t("Demotilassa syntyy paikallinen mallipohjaluonnos aineisto-otteineen. Aineistopohjainen AI-generointi edellyttää OpenAI API:n käyttöönottoa.")
-                : t("Generointi käyttää OpenAI API:a ja voi olla maksullista. Tuotos on ihmisen tarkistettava AI-luonnos.")}</p>
-              <p className="field-hint">{t("Tietopohjana käytetään projektin aineistoa. Ulkoista tiedonhakua tai riippumatonta lähdevarmennusta ei tehdä. Lähdetiedot, ehdotukset ja epävarmuudet erotetaan toisistaan.")}</p>
-            </> : <p className="field-hint">{t("Promptien ja suunnitelman mockhienosäätö löytyy canvaksen Promptit ja toteutussuunnitelma -välilehdeltä. Promptit ja suunnitelma valmistuvat ilman API-avainta.")}</p>}
-          </section>
-          <div><h2>{t("Vertaa ratkaisukandidaatteja")}</h2><p className="subtitle mb-5">{t("Tarkista jokaisen ehdotuksen alkuperämerkintä. Hyväksyntä tuottaa valitsemasi lopputuloksen; se ei vahvista ehdotuksen oikeellisuutta.")}</p>
-            <div className="candidate-grid">{candidates.map((candidate, index) => <article className={`panel candidate-card ${candidate.is_selected ? "selected" : ""}`} key={candidate.id}>
-              <p className="eyebrow">{t("Vaihtoehto")} {String.fromCharCode(65 + index)}{candidate.is_selected ? t(" · Valittu") : ""}</p>
+      {currentCandidates.length > 0 && <div className="workspace-section-heading panel">
+        <div><h2>{t("Tilannekuvasta päätökseen")}</h2><p className="subtitle">{t("Tarkista havainnot ja vertaile niiden pohjalta syntyneitä vaihtoehtoja.")}</p></div>
+        <button className="button-primary" onClick={() => navigateStage(2)}>{t("Vertaa vaihtoehtoja →")}</button>
+      </div>}
+    </section>}
+
+    {stage === 2 && <section id="stage-2" role="tabpanel" aria-labelledby="tab-2" className="space-y-6">
+      <div className="workspace-section-heading"><div><p className="eyebrow">Decide</p><h2>{t("Valitse seuraava teko")}</h2>
+        <p className="subtitle">{t("Ratkaisuehdotus kertoo, miten ongelmaa lähestytään. Päätös määrittelee seuraavan teon ja onnistumiskriteerin. Tuotos tehdään erikseen Toimi-osiossa.")}</p></div>
+        <button className="button-secondary" onClick={() => navigateStage(1)}>{t("Tarkista tilannekuva")}</button>
+      </div>
+      {!candidates.length && <div className="panel empty-state"><h2>{t("Vaihtoehdot syntyvät analyysistä")}</h2>
+        <p>{t("Kokoa ja analysoi aineisto ensin. Mitään ratkaisua ei valita automaattisesti.")}</p>
+        <button className="button-primary mt-5" onClick={() => navigateStage(1)}>{t("Muodosta tilannekuva →")}</button></div>}
+      {decisionLocked && <section className="panel space-y-4"><h2>{t("Vahvistettu päätös")}</h2>
+        <h3>{selectedCandidate?.title}</h3><p className="whitespace-pre-wrap">{iteration.decision_rationale}</p>
+        <p className="whitespace-pre-wrap">{iteration.hypothesis}</p>
+        <p className="notice">{t("Kierroksen päätös on lukittu. Tuotostyyppiä voi vaihtaa Toimi-osiossa muuttamatta ratkaisua. Uusi ratkaisu edellyttää uutta päätöskierrosta.")}</p>
+        <button className="button-primary" onClick={() => navigateStage(3)}>{t("Siirry tekemään tuotoksia →")}</button>
+      </section>}
+      {!iteration && candidates.length > 0 && <p className="notice">{t("Aloita seuraava kierros lisäämällä uutta aineistoa ja analysoimalla se. Aiemmat päätökset ja tuotokset säilyvät.")}</p>}
+      {candidates.length > 0 && !decisionLocked && <>
+          <div><h2>{t("Vertaa ratkaisukandidaatteja")}</h2><p className="subtitle mb-5">{t("Valinta on luonnos, kunnes vahvistat päätöksen. Ehdotuksen valitseminen ei tee API-kutsuja eikä käynnistä tuotosta.")}</p>
+            <div className="candidate-grid">{candidates.map((candidate, index) => <article className={`panel candidate-card ${candidate.id === draftCandidateId ? "selected" : ""}`} key={candidate.id}>
+              <p className="eyebrow">{t("Vaihtoehto")} {String.fromCharCode(65 + index)}{candidate.id === draftCandidateId ? t(" · Valittu") : ""}</p>
               <h2>{candidate.title}</h2><p className="text-sm leading-6 text-slate-600">{candidate.summary}</p>
               <GenerationNotice mode={candidate.generation_mode} />
               {candidate.is_superseded && <p className="notice">{t("Lähdeaineisto on muuttunut. Tämä on aiempi ratkaisuehdotus; päivitä analyysi ennen uutta hyväksyntää.")}</p>}
@@ -362,26 +378,54 @@ export function WorkspaceView({ initial }: { initial: Workspace }) {
               <div><h3 className="mb-2 text-sm">{t("Liiketoimintahyödyt")}</h3><ul>{candidate.benefits.map((benefit, i) => <li key={i}>{benefit}</li>)}</ul></div>
               <div><h3 className="mb-2 text-sm">{t("Riskit ja huomioitavaa")}</h3><ul>{candidate.risks.map((risk, i) => <li key={i}>{risk}</li>)}</ul></div>
               <details><summary>{t("Ratkaisukuvaus ja ehdotettu toimintatapa")}</summary><pre className="agenda mt-3">{candidate.architecture_spec}</pre></details>
-              <button className="button-primary mt-auto" disabled={!!busy || !canApprove || candidate.is_superseded
-                || (candidate.is_selected && project.delivery_mode === deliveryMode)}
-                onClick={() => choose(candidate.id)}>
-                {busy === candidate.id ? t("Valmistellaan…") : candidate.is_selected && project.delivery_mode === deliveryMode ? t("Valittu toimitukseen")
-                  : selectedCandidate ? candidate.is_selected ? t("Muuta lopputulosta") : t("Vaihda tähän ratkaisuun")
-                  : deliveryMode === "AGENTS" ? demo ? t("Hyväksy ja simuloi agenttitoteutus") : t("Hyväksy ja käynnistä agenttitoteutus")
-                  : isWrittenOutput(deliveryMode) ? t(writtenOutputs[deliveryMode].action)
-                    : deliveryMode === "PLAN" ? t("Hyväksy ja tuota toteutussuunnitelma") : t("Hyväksy ja vie promptipaketti")}</button>
+              <button type="button" className="button-secondary mt-auto" aria-pressed={candidate.id === draftCandidateId}
+                disabled={!!busy || !canDecide || candidate.is_superseded || candidate.iteration_id !== iteration?.id}
+                onClick={() => setDraftCandidateId(candidate.id)}>
+                {candidate.id === draftCandidateId ? t("Valittu päätösluonnokseen") : t("Valitse ratkaisuehdotus")}</button>
             </article>)}</div>
           </div>
+          {canDecide && <form className="panel space-y-5" onSubmit={confirmDecision}>
+            <h2>{t("Vahvista seuraava teko")}</h2>
+            <p>{draftCandidate?.title ?? t("Valitse ensin ratkaisuehdotus yllä olevista vaihtoehdoista.")}</p>
+            <label>{t("Miksi tämä ratkaisu?")}<textarea required rows={3} maxLength={5000} value={decisionRationale}
+              onChange={(event) => setDecisionRationale(event.target.value)} disabled={!!busy} /></label>
+            <label>{t("Seuraava teko ja onnistumiskriteeri")}<textarea required rows={4} maxLength={5000} value={hypothesis}
+              placeholder={t("Mitä kokeillaan seuraavaksi, ja mistä tiedetään sen auttaneen?")}
+              onChange={(event) => setHypothesis(event.target.value)} disabled={!!busy} /></label>
+            <p className="field-hint">{t("Vahvistus tallentaa päätöksen ja siirtää kierroksen ACT-tilaan. Se ei generoi dokumentteja eikä käynnistä agentteja.")}</p>
+            <button className="button-primary" disabled={!!busy || !draftCandidate || draftCandidate.is_superseded || draftCandidate.iteration_id !== iteration?.id}>
+              {busy === "decision" ? t("Tallennetaan…") : t("Vahvista päätös ja siirry toimimaan")}</button>
+          </form>}
         </>}
     </section>}
 
     {stage === 3 && <section id="stage-3" role="tabpanel" aria-labelledby="tab-3" className="space-y-6">
-      <div><p className="eyebrow">{t("Vaihe 3 · Valittu lopputulos")}</p><h2>{project.delivery_mode === "AGENTS" ? t("Agenttitoteutuksen eteneminen")
+      <div><p className="eyebrow">Act</p><h2>{project.delivery_mode === "AGENTS" ? t("Agenttitoteutuksen eteneminen")
         : project.delivery_mode && isWrittenOutput(project.delivery_mode) ? t(writtenOutputs[project.delivery_mode].title)
           : project.delivery_mode === "PLAN" ? t("Toteutussuunnitelma") : t("Tuotokset")}</h2>
         <p className="subtitle">{project.status === "READY_FOR_REVIEW" ? t("Valittu lopputulos on valmis katselmoitavaksi. Tarkista tuotosten alkuperämerkinnät.")
-          : polling ? t("Tila ja lokit päivittyvät automaattisesti 2 sekunnin välein.") : t("Valitse ratkaisu ja tarpeeseen sopiva tuotos. Koodausta tai agentteja ei tarvita kaikkiin ratkaisuihin.")}</p></div>
-      {selectedCandidate && <button className="button-secondary" onClick={() => setStage(2)}>{t("Vertaa vaihtoehtoja tai muuta valintaa")}</button>}
+          : polling ? t("Tila ja lokit päivittyvät automaattisesti 2 sekunnin välein.") : t("Tuotos tukee ratkaisua. Koodausta tai agentteja ei tarvita kaikkiin ratkaisuihin.")}</p></div>
+      {selectedCandidate && <button className="button-secondary" onClick={() => navigateStage(2)}>{t("Katso päätös tai ratkaisuvaihtoehdot")}</button>}
+      {canCreateOutput ? <form className="panel space-y-5" onSubmit={createOutput}>
+        <div><h2>{t("Tarvitsetko dokumentin tai toteutuksen?")}</h2>
+          <p className="subtitle">{t("Tuotos tukee vahvistettua ratkaisua. Voit vaihtaa tuotostyyppiä tai tehdä uuden version ilman uutta ratkaisupäätöstä.")}</p></div>
+        <p><strong>{t("Vahvistettu ratkaisu:")}</strong> {selectedCandidate?.title}</p>
+        <label>{t("Valitse tuotos")}<select value={deliveryMode} disabled={!!busy}
+          onChange={(event) => setDeliveryMode(deliveryModeSchema.parse(event.target.value))}>
+          {Object.entries(deliveryLabels).map(([value, label]) => <option key={value} value={value}>{t(label)}</option>)}
+        </select></label>
+        <label>{t("Tuotoksen rajaus tai tarkennukset")}<textarea rows={3} maxLength={5000} value={refinement}
+          onChange={(event) => setRefinement(event.target.value)} disabled={!!busy} /></label>
+        {isWrittenOutput(deliveryMode) && <p className="notice">{demo
+          ? t("Demotilassa syntyy paikallinen mallipohjaluonnos aineisto-otteineen. Aineistopohjainen AI-generointi edellyttää OpenAI API:n käyttöönottoa.")
+          : t("Generointi käyttää OpenAI API:a ja voi olla maksullista. Tuotos on ihmisen tarkistettava AI-luonnos.")}</p>}
+        {deliveryMode === "AGENTS" && <p className="notice">{demo
+          ? t("Vahvistus käynnistää uuden simuloidun agenttiketjun.")
+          : t("Vahvistus käynnistää uuden agenttiketjun ja voi tehdä maksullisia API-kutsuja.")}</p>}
+        {["PLAN", "PROMPTS"].includes(deliveryMode) && <p className="field-hint">{t("Promptit ja suunnitelma koostetaan paikallisesti ilman API-kutsuja.")}</p>}
+        <button className="button-primary" disabled={!!busy}>
+          {busy === "output" ? t("Valmistellaan…") : deliveryMode === "AGENTS" ? t("Käynnistä agenttitoteutus") : t("Laadi valittu tuotos")}</button>
+      </form> : !decisionLocked && <p className="notice">{t("Vahvista päätös Päätä-osiossa ennen uuden tuotoksen tekemistä. Aiemmat tuotokset ovat edelleen katselmoitavissa.")}</p>}
       {project.delivery_mode && isWrittenOutput(project.delivery_mode) && <div className="space-y-3">
         <GenerationNotice mode={project.delivery_generation_mode} />
         <p className="notice">{t("Tämä tuotos perustuu toimitettuun projektiaineistoon. Se ei ole ulkoisilla lähteillä varmennettu selvitys. Tarkista lähdeviitteet, tulkinnat ja avoimet kysymykset ennen hyväksymistä.")}</p>
@@ -392,13 +436,14 @@ export function WorkspaceView({ initial }: { initial: Workspace }) {
           : project.active_delivery_id ? t("Toimituksena on yhteinen toteutusprompti. Lataa se palvelusta ja käytä valitsemassasi työkalussa.")
           : t("Aiempi prompttitoimitus säilyy alkuperäisenä. Uuden yhteisen toteutuspromptin voit ladata Ratkaisut-vaiheen canvaksesta.")}  {t("Agentteja ei käynnistetty eikä koodia suoritettu. Varsinaisesta toteutuksesta voidaan sopia erikseen.")} </p>}
       {project.delivery_mode && isWrittenOutput(project.delivery_mode) &&
-        <Artifacts id={id} files={workspace.artifacts} activeDeliveryId={project.active_delivery_id} />}
+        <Artifacts id={id} files={workspace.artifacts} activeDeliveryId={project.active_delivery_id}
+          awaitingDelivery={decisionLocked && !project.active_delivery_id} />}
       {candidates.filter((candidate) => candidate.is_selected).map((candidate) =>
         <div key={candidate.id}><p className="field-hint">{t("Ratkaisuehdotuksen alkuperä")}</p><GenerationNotice mode={candidate.generation_mode} />
           {candidate.is_superseded && <p className="notice">{t("Lähdeaineisto on muuttunut. Tämä on aiempi ratkaisuehdotus; päivitä analyysi ennen uutta hyväksyntää.")}</p>}
-          <details className="mt-4"><summary>{t("Ratkaisun etenemisen seuranta")}</summary><div className="mt-3">
+          <div className="mt-4">
             <ImplementationTracker id={id} candidate={candidate}
-              locked={project.status === "BUILDING"} onSaved={() => refresh()} /></div></details></div>)}
+              locked={project.status === "BUILDING"} onSaved={() => refresh()} /></div></div>)}
       {failedTask && <p className="error-message" role="alert">{t("Agentti")} {t(roleLabels[failedTask.agent_role])}  {t("epäonnistui. Tarkista alla olevat lokit ja worker-palvelun asetukset. Toteutusta ei ole merkitty valmiiksi.")}</p>}
       {project.delivery_mode === "AGENTS" && <div className="kanban">{agentRoles.map((role, index) => {
         const task = tasks.find((task) => task.agent_role === role);
@@ -411,7 +456,26 @@ export function WorkspaceView({ initial }: { initial: Workspace }) {
         </section>;
       })}</div>}
       {(!project.delivery_mode || !isWrittenOutput(project.delivery_mode)) &&
-        <Artifacts id={id} files={workspace.artifacts} activeDeliveryId={project.active_delivery_id} />}
+        <Artifacts id={id} files={workspace.artifacts} activeDeliveryId={project.active_delivery_id}
+          awaitingDelivery={decisionLocked && !project.active_delivery_id} />}
+      {candidates.length > 0 && <details className="workspace-disclosure"><summary>{t("Ratkaisukuvaus, canvas ja viennit")}</summary>
+        <div className="mt-5"><SolutionCanvas workspace={workspace} refinement={refinement} onRefinementChange={setRefinement} /></div>
+      </details>}
+      {decisionLocked && project.status === "READY_FOR_REVIEW" && project.active_delivery_id && <form className="panel space-y-5" onSubmit={completeCycle}>
+        <h2>{t("Katselmoi ja päätä kierros")}</h2>
+        <p className="subtitle">{t("Valmis dokumentti ei todista vaikutusta. Kirjaa katselmointi, havaittu vaikutus tai vielä puuttuva näyttö ennen seuraavaa kierrosta.")}</p>
+        <label>{t("Katselmointi ja opit")}<textarea required rows={4} maxLength={10000} value={feedback}
+          onChange={(event) => setFeedback(event.target.value)} disabled={!!busy} /></label>
+        <button className="button-primary" disabled={!!busy}>{busy === "complete" ? t("Tallennetaan…") : t("Hyväksy katselmointi ja päätä kierros")}</button>
+      </form>}
+      <section className="loop-return panel">
+        <div><p className="eyebrow">{t("Takaisin havaintoihin")}</p><h2>{t("Mitä toiminnasta opittiin?")}</h2>
+          <p className="subtitle">{decisionLocked
+            ? t("Kierroksen päätös on vahvistettu. Katselmoi tuotos ja päätä kierros Toimi-osiossa ennen aineiston muuttamista.")
+            : t("Kirjaa vaikutukset seurannan muistiinpanoihin. Lisää kokeilun palaute uutena työpaja-aineistona ja päivitä tilannekuva. Aiemmat päätökset ja toimitukset säilyvät.")}</p>
+        </div>
+        <button className="button-secondary" disabled={decisionLocked || !!busy} onClick={() => navigateStage(0)}>{t("Lisää uusia havaintoja")} <span aria-hidden="true">↻</span></button>
+      </section>
     </section>}
   </main>;
 }

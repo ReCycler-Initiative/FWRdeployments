@@ -17,6 +17,14 @@ def vtt_time(seconds: float) -> str:
 
 
 async def transcribe(settings: Settings, project_id: UUID, session: dict, language: str = "fi") -> str:
+    parts = session.get("transcripts") or []
+    if parts:
+        if len(parts) == 1:
+            return parts[0]["content"]
+        return "\n\n".join(
+            f"### Transcript: {part['title']} [{part['id']}]\n{part['content']}"
+            for part in parts
+        )
     if session.get("transcript_vtt"):
         return session["transcript_vtt"]
     if settings.mock_ai:

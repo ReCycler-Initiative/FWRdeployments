@@ -12,8 +12,8 @@ export default async function Home() {
   const projects = await listProjects();
   return <main className="shell">
     <header className="page-heading">
-      <div><p className="eyebrow">{t("Ongelmasta toteutukseen")}</p><h1>{t("Projektityötilat")}</h1>
-        <p className="subtitle">{t("Valmistele työpaja. Arvioi ratkaisut. Käynnistä toteutus.")}</p></div>
+      <div><p className="eyebrow">{t("Ongelmasta ratkaisuun")}</p><h1>{t("Projektityötilat")}</h1>
+        <p className="subtitle">{t("Valmistele työpaja. Arvioi vaihtoehdot. Tuota tarpeeseen sopiva lopputulos.")}</p></div>
       <span className="count-label">{projects.length}  {t("projektia")}</span>
     </header>
     <div className="dashboard-grid">

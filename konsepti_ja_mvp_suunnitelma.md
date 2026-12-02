@@ -9,7 +9,8 @@
   or consulting hours. Facilitated discussions become evaluated alternatives
   and an appropriate delivery.
 - **Value proposition:** a half-day workshop can lead to evaluated candidates,
-  a reviewable prototype, a plan or refined implementation prompts. A working
+  a report, recommendation, operating model, guidance, experiment or, when useful,
+  a reviewable prototype, software plan or implementation prompt. A working
   production solution is not guaranteed by automatic generation.
 - **Commercialization:**
   1. Productized expert service (MVP): forward-deployed engineers use the workspace
@@ -17,8 +18,8 @@
   2. Hybrid service: workshops plus recurring maintenance and development.
   3. Scalable SaaS: customer teams use the workspace independently.
 
-**Product refinement:** an agent farm is optional. A process change, live artifact,
-implementation plan or export to GitHub Copilot/Claude may be sufficient.
+**Product refinement:** solving the problem does not necessarily require software.
+A source-grounded report or operational change may be the final outcome.
 Multiple projects and multiple workshops per project are first-class concepts.
 
 ## 2. Four-stage architecture
@@ -57,23 +58,38 @@ candidates are fixed examples, not findings extracted from the uploaded evidence
 VTT/TXT content analysis needs an OpenAI API configuration, not video. Audio/face
 measurement requires video and the separately configured signal service.
 
-### Stage 3 — Human approval and appropriate delivery
+### Stage 3 — Human approval and outputs
 
-Choose a candidate and delivery mode:
+Choose a candidate and an appropriate output:
 
-- `PROMPTS`: one portable implementation prompt for Copilot, Claude or another tool (default).
+- `REPORT` (default): investigation scope, supplied evidence, information gaps
+  and further verification.
+- `RECOMMENDATION`: alternatives, decision criteria, conditions and open questions.
+- `PROCESS`: an operating model or process description with roles and handovers.
+- `GUIDE`: practical guidance or training material.
+- `EXPERIMENT`: hypothesis, baseline, measures, success/stop criteria and review.
+- `PROMPTS`: one portable implementation prompt for Copilot, Claude or another tool.
 - `PLAN`: a standalone implementation plan with decision gates.
 - `AGENTS`: an explicit LangGraph architect → coder → data → QA chain.
 
 Local mock refinement needs no provider key. Real integrations require explicit
-configuration. Track the selected solution's progress manually even when coding
-occurs in an external tool. A ready prompt is not a completed implementation.
+configuration. The five non-code output types generate standalone documents,
+not instructions to a coding agent. They use local templates with source excerpts
+in mock mode, or structured OpenAI generation in real mode.
+Source-reported information, proposals and uncertainty are labeled separately.
+Only supplied source identifiers may be cited. External research and independent
+source verification are not implemented; no AI draft is a verified study.
+Track review, operational changes and other follow-up work manually.
+A ready document does not prove that the intended benefit has been achieved.
 After delivery, alternatives remain reviewable and the approved choice/outcome
 can be replaced with explicit confirmation. Keep previous files and per-candidate
 tracking; show only the current run in the Kanban. Replacements are blocked during
 `BUILDING` and rejected when based on a stale decision.
-Each workshop can store, replace, preview or remove a VTT/TXT transcript separately
-from its agenda and video. Saving is local; analysis is an explicit action.
+Each workshop stores multiple named VTT/TXT sources separately from its agenda and
+video. Adding is the default; replacement, preview and confirmed removal target
+one source only. Equivalent VTT/TXT copies are rejected within that workshop.
+Saving is local; explicit analysis combines all active sources. Timestamps are
+source-local; multiple transcripts do not use one recording's video signal fusion.
 Corrections invalidate prior analysis and supersede proposals, without deleting
 earlier decisions or deliveries. Future ChatGPT-assisted solution improvement
 before prompt export remains a roadmap feature, not current template refinement.
@@ -89,17 +105,20 @@ Project statuses:
 5. `READY_FOR_REVIEW`: delivery artifacts are ready for human review.
 
 Before approval, another workshop returns the project to `WORKSHOP_UPLOADED`.
-Prompt/plan deliveries skip `BUILDING`. Independent solution implementation
+Written outputs and prompt/plan deliveries skip `BUILDING`. Independent solution progress
 states are `NOT_STARTED`, `IN_PROGRESS`, `BLOCKED`, `IN_REVIEW`, `COMPLETED`.
 
 Core tables:
 
 - `projects`: UUID, title, description, target systems (JSONB), status, agenda,
-  content language (`fi`/`en`), delivery mode and timestamps.
+  content language (`fi`/`en`), delivery mode, delivery generation provenance and timestamps.
 - `context_documents`: project FK, filename, content, VECTOR(1536) embedding,
   source type/URL/revision, storage path and creation time.
 - `sessions`: project FK, workshop title/focus/time/link/agenda, recording path,
-  VTT transcript, pain points (JSONB), Mermaid diagram and lifecycle timestamps.
+  derived transcript compatibility cache, pain points (JSONB), Mermaid diagram and lifecycle timestamps.
+- `workshop_transcripts`: project/workshop FKs, source title, original filename,
+  optional storage path, original content, generated spoken-content fingerprint
+  and timestamps. Rows represent current sources; replacement removes old content.
 - `solution_candidates`: project FK, title, summary, benefits/risks (JSONB),
   architecture, provenance, selection, solution type and manual implementation tracking
   (the nullable legacy cost column is retained only for data compatibility).
@@ -113,7 +132,7 @@ in [db/migrations](db/migrations/).
 ## 4. Interface and monorepo
 
 Next.js and Tailwind provide a multi-project dashboard at `/` and a project
-workspace at `/projects/[id]`. Preparation, Workshop, Solutions and Delivery are
+workspace at `/projects/[id]`. Preparation, Workshop, Solutions and Outputs are
 tabs within that page rather than separate `/prepare`, `/analysis`, `/build` routes.
 Finnish and English are selectable; project content language is independent.
 

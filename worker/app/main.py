@@ -12,7 +12,8 @@ from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from app.agents.chain import ROLES, run_chain
 from app.config import Settings
-from app.models import AnalyzeRequest, BuildRequest
+from app.models import AnalyzeRequest, BuildRequest, OutputRequest
+from app.outputs import generate_output
 from app.pipeline.signals import signals
 from app.pipeline.synthesize import generate_agenda, synthesize
 from app.pipeline.transcribe import transcribe
@@ -108,6 +109,17 @@ async def locked_project(connection, project_id: UUID) -> dict:
     return project
 
 
+async def attach_transcripts(connection, project_id: UUID, workshops: list[dict]) -> None:
+    parts = await (await connection.execute(
+        "SELECT id,session_id,title,filename,content FROM workshop_transcripts WHERE project_id=%s ORDER BY created_at,id",
+        (project_id,),
+    )).fetchall()
+    for workshop in workshops:
+        workshop["transcripts"] = [part for part in parts if part["session_id"] == workshop["id"]]
+        if workshop["transcripts"]:
+            workshop["transcript_vtt"] = None
+
+
 async def context_for(connection, project: dict, analysis_session_id: UUID | None = None) -> dict:
     documents = await (await connection.execute(
         """SELECT filename, content_text FROM context_documents
@@ -119,6 +131,7 @@ async def context_for(connection, project: dict, analysis_session_id: UUID | Non
            AND (processed_at IS NOT NULL OR (%s::uuid IS NOT NULL AND transcript_vtt IS NOT NULL))
            ORDER BY created_at, id""", (project["id"], analysis_session_id, analysis_session_id)
     )).fetchall()
+    await attach_transcripts(connection, project["id"], workshops)
     return {"project": project, "documents": documents, "previous_workshops": workshops}
 
 
@@ -152,6 +165,50 @@ class AgendaRequest(BaseModel):
     session_id: UUID | None = None
 
 
+@app.post("/api/projects/{project_id}/generate-output")
+async def output(project_id: UUID, body: OutputRequest) -> dict:
+    async with pool.connection() as connection:
+        project = await (await connection.execute(
+            "SELECT id, title, description, target_systems, language, status FROM projects WHERE id=%s", (project_id,),
+        )).fetchone()
+        if not project:
+            raise HTTPException(404, "Project not found")
+        if project["status"] not in ("CANDIDATES_READY", "READY_FOR_REVIEW"):
+            raise HTTPException(409, "Outputs require current solution candidates")
+        alternatives = await (await connection.execute(
+            """SELECT id, title, summary, benefits, risks, architecture_spec, solution_type, generation_mode
+               FROM solution_candidates WHERE project_id=%s AND NOT is_superseded ORDER BY id""", (project_id,),
+        )).fetchall()
+        candidate = next((item for item in alternatives if item["id"] == body.candidate_id), None)
+        if not candidate:
+            raise HTTPException(404, "Current candidate not found")
+        documents = await (await connection.execute(
+            """SELECT id, filename, content_text, source_url, source_revision
+               FROM context_documents WHERE project_id=%s ORDER BY created_at, id""", (project_id,),
+        )).fetchall()
+        workshops = await (await connection.execute(
+            """SELECT id, title, notes, transcript_vtt, transcript_path, video_path, analysis_mode
+               FROM sessions WHERE project_id=%s ORDER BY created_at, id""", (project_id,),
+        )).fetchall()
+        await attach_transcripts(connection, project_id, workshops)
+    try:
+        real_config()
+        async with asyncio.timeout(110):
+            result = await generate_output(settings, {
+                "project": project, "candidate": candidate, "alternatives": alternatives,
+                "documents": documents, "workshops": workshops,
+            }, body.output_type, body.refinement)
+    except HTTPException:
+        raise
+    except TimeoutError as exc:
+        logger.exception("Output generation timed out for %s", project_id)
+        raise HTTPException(504, "Output generation timed out; retry with a narrower scope.") from exc
+    except Exception as exc:
+        logger.exception("Output generation failed for %s", project_id)
+        raise HTTPException(502, f"Output generation failed: {failure_detail(exc)}") from exc
+    return result.model_dump()
+
+
 @app.post("/api/projects/{project_id}/generate-agenda")
 async def agenda(project_id: UUID, body: AgendaRequest | None = None) -> dict:
     async with pool.connection() as connection:
@@ -169,7 +226,10 @@ async def agenda(project_id: UUID, body: AgendaRequest | None = None) -> dict:
                 )).fetchone()
                 if not workshop:
                     raise HTTPException(404, "Työpaja ei kuulu projektiin.")
-                if workshop["video_path"]:
+                transcript = await (await connection.execute(
+                    "SELECT id FROM workshop_transcripts WHERE session_id=%s", (workshop_id,),
+                )).fetchone()
+                if workshop["video_path"] or transcript:
                     raise HTTPException(409, "Tallennetun työpajan runkoa ei voi muuttaa jälkikäteen.")
                 context["workshop"] = workshop
             try:
@@ -208,10 +268,16 @@ async def analyze(project_id: UUID, body: AnalyzeRequest) -> dict:
             )).fetchone()
             if active:
                 raise HTTPException(409, "An analysis is already running for this project")
-            if not session["video_path"] and not session["transcript_path"]:
+            await attach_transcripts(connection, project_id, [session])
+            if not session["video_path"] and not session["transcripts"]:
                 raise HTTPException(409, "Työpajalle on ensin lisättävä tallenne tai transkriptio.")
-            real_config(video=bool(session["video_path"] and session["video_path"].lower().endswith(".mp4")))
+            real_config(video=bool(len(session["transcripts"]) <= 1 and session["video_path"]
+                                   and session["video_path"].lower().endswith(".mp4")))
             context = await context_for(connection, project, body.session_id)
+            context["analysis_transcripts"] = [
+                {"id": part["id"], "title": part["title"], "filename": part["filename"]}
+                for part in session["transcripts"]
+            ]
             await connection.execute("UPDATE projects SET status='WORKSHOP_UPLOADED' WHERE id=%s", (project_id,))
             await connection.execute("UPDATE solution_candidates SET is_superseded=true WHERE project_id=%s", (project_id,))
             await connection.execute(
@@ -273,7 +339,7 @@ async def analysis_job(project_id: UUID, session_id: UUID, session: dict, contex
                         """UPDATE sessions SET transcript_vtt = %s, pain_points_json = %s,
                            current_state_mermaid = %s, analysis_mode = %s, processed_at = now()
                            WHERE id = %s AND project_id = %s""",
-                        (transcript, Jsonb([p.model_dump() for p in result.pain_points]),
+                        (transcript, Jsonb([p.model_dump(mode="json") for p in result.pain_points]),
                          result.current_state_mermaid, "mock" if settings.mock_ai else "ai", session_id, project_id),
                     )
                     await connection.execute(
@@ -337,7 +403,7 @@ async def build(project_id: UUID, body: BuildRequest) -> dict:
                 "UPDATE solution_candidates SET is_selected = true WHERE id = %s", (body.candidate_id,)
             )
             await connection.execute(
-                """UPDATE projects SET status = 'BUILDING', delivery_mode = 'AGENTS',
+                """UPDATE projects SET status = 'BUILDING', delivery_mode = 'AGENTS', delivery_generation_mode = NULL,
                    active_delivery_id = %s WHERE id = %s""", (delivery_id, project_id)
             )
             await connection.execute(

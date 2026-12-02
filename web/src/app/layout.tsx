@@ -25,7 +25,7 @@ export default async function RootLayout({ children }: LayoutProps<"/">) {
           <LanguageSwitcher />
         </nav>
         {children}
-        <footer className="shell footer">{t("FRWDeployments · Ihminen päättää, agentit toteuttavat.")}</footer>
+        <footer className="shell footer">{t("FRWDeployments · Ihminen päättää, tuotos tukee ratkaisua.")}</footer>
         </LocaleProvider>
       </body>
     </html>

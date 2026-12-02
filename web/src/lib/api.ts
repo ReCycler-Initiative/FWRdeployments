@@ -51,7 +51,7 @@ export async function apiResponse(operation: () => Promise<Response>) {
 }
 
 export async function callWorker(
-  id: string, action: "generate-agenda" | "analyze" | "build" | "extract-context", body?: object,
+  id: string, action: "generate-agenda" | "generate-output" | "analyze" | "build" | "extract-context", body?: object,
 ) {
   const base = process.env.WORKER_URL;
   if (!base) throw new ApiError(503, "WORKER_URL ei ole määritetty.");
@@ -61,7 +61,7 @@ export async function callWorker(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body ?? {}),
-      signal: AbortSignal.timeout(action === "generate-agenda" ? 120000 : action === "extract-context" ? 40000 : 15000),
+      signal: AbortSignal.timeout(action === "generate-agenda" || action === "generate-output" ? 120000 : action === "extract-context" ? 40000 : 15000),
       cache: "no-store",
     });
   } catch (error) {

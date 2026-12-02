@@ -7,6 +7,7 @@ import { useEffect, useState } from "react";
 import { z } from "zod";
 import { postJson, requestJson } from "@/lib/client-api";
 import type { Workspace } from "@/lib/types";
+import { isWrittenOutput, writtenOutputs } from "@/lib/deliveries";
 import { Artifacts } from "./artifacts";
 import { implementationLabels, solutionTypeLabels } from "./implementation-tracker";
 import { GenerationNotice } from "./ai-notice";
@@ -56,7 +57,7 @@ export function SolutionCanvas({ workspace, refinement, onRefinementChange }: {
   if (!candidate) return null;
   return <section className="panel solution-canvas">
     <div className="flex flex-wrap items-start justify-between gap-4">
-      <div><p className="eyebrow">{t("Live canvas · Fasilitoitu Forward Deployment")}</p><h2>{t("Ratkaisun katselmointi ja toteutuspromptit")}</h2>
+      <div><p className="eyebrow">{t("Live canvas · Fasilitoitu Forward Deployment")}</p><h2>{t("Ratkaisun katselmointi ja tuotokset")}</h2>
         <p className="subtitle">{t("Elävä ratkaisuluonnos ja syntyvät tuotokset. Koodi ei käynnisty automaattisesti.")}</p></div>
       <span className="system-tag">{project.status === "BUILDING" ? t("● Päivittyy 2 s välein") : project.status === "READY_FOR_REVIEW" ? t("Valmis katselmointiin") : t("Ratkaisuluonnos")}</span>
     </div>
@@ -74,21 +75,22 @@ export function SolutionCanvas({ workspace, refinement, onRefinementChange }: {
       <article className="canvas-node canvas-focus"><p className="eyebrow">{t("Ratkaisu")}</p><h3>{candidate.title}</h3>
         <p className="mt-2 text-xs text-blue-700">{t(solutionTypeLabels[candidate.solution_type])}</p>
         <p className="mt-3 text-sm leading-6 text-slate-600">{candidate.summary}</p>
-        <button className="button-secondary mt-4" onClick={() => setView("architecture")}>{t("Katselmoi arkkitehtuuri")}</button>
+        <button className="button-secondary mt-4" onClick={() => setView("architecture")}>{t("Katso ratkaisukuvaus")}</button>
       </article>
-      <article className="canvas-node"><p className="eyebrow">{t("Toteutuspolku")}</p><h3>{candidate.is_selected ? t("Hyväksytty toteutukseen") : t("Odottaa ihmisen hyväksyntää")}</h3>
-      {candidate.is_selected && <p className="mt-2 text-sm font-semibold">{t("Ratkaisun toteutus:")} {t(implementationLabels[candidate.implementation_status])}</p>}
+      <article className="canvas-node"><p className="eyebrow">{t("Ratkaisupolku")}</p><h3>{candidate.is_selected ? t("Valittu ratkaisu") : t("Odottaa ihmisen hyväksyntää")}</h3>
+      {candidate.is_selected && <p className="mt-2 text-sm font-semibold">{t("Ratkaisun tila:")} {t(implementationLabels[candidate.implementation_status])}</p>}
         <p className="mt-3 text-sm leading-6 text-slate-500">{project.delivery_mode === "AGENTS" ? t("Arkkitehti → Koodaus → Data → QA")
           : project.delivery_mode === "PLAN" ? t("Toteutussuunnitelma – ei automaattista koodausta")
-          : t("Promptit ja live-artefaktit voivat riittää ilman agenttifarmia.")}</p>
+            : project.delivery_mode && isWrittenOutput(project.delivery_mode) ? t(writtenOutputs[project.delivery_mode].title)
+              : t("Selvitys, toimintamalli tai muu tuotos voi riittää ilman koodausta.")}</p>
         <p className="mt-2 text-xs text-slate-500">{project.delivery_mode === "AGENTS" ? `${workspace.tasks.filter((task) => task.status === "completed").length}/4 ${t("agenttia valmiina")} · ` : ""}{workspace.artifacts.length}  {t("artefaktia")}</p>
         <button className="button-secondary mt-4" onClick={() => setView("artifacts")}>{t("Avaa syntyvät tuotokset")}</button>
       </article>
     </div>
     <div className="mt-5 flex flex-wrap gap-2" aria-label={t("Canvaksen katselmointikohde")}>
-      <button className={view === "architecture" ? "button-primary" : "button-secondary"} onClick={() => setView("architecture")}>{t("Arkkitehtuuri")}</button>
+      <button className={view === "architecture" ? "button-primary" : "button-secondary"} onClick={() => setView("architecture")}>{t("Ratkaisukuvaus")}</button>
       <button className={view === "prompt" ? "button-primary" : "button-secondary"} onClick={() => setView("prompt")}>{t("Promptit ja toteutussuunnitelma")}</button>
-      <button className={view === "artifacts" ? "button-primary" : "button-secondary"} onClick={() => setView("artifacts")}>{t("Live-artefaktit ja prototyyppi")}</button>
+      <button className={view === "artifacts" ? "button-primary" : "button-secondary"} onClick={() => setView("artifacts")}>{t("Syntyneet tuotokset")}</button>
     </div>
     {view === "architecture" && <pre className="agenda mt-5">{candidate.architecture_spec}</pre>}
     {view === "prompt" && <div className="mt-5 space-y-4">

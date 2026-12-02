@@ -60,10 +60,12 @@ additive migrations for upgrades. See the [README migration guide](readme.md#upg
 4. Review workshop-specific quotes, pain points, Mermaid diagrams and three
    alternatives. Later workshops retain history and refresh current candidates.
 5. Review the live canvas and refine/export Copilot/Claude prompts or a plan.
-6. Approve a candidate with `PROMPTS`, `PLAN` or explicitly `AGENTS` delivery.
+6. Approve a candidate with `REPORT` (default), `RECOMMENDATION`, `PROCESS`,
+   `GUIDE`, `EXPERIMENT`, `PROMPTS`, `PLAN` or explicitly `AGENTS` delivery.
    Only the last starts `BUILDING` and the four-role agent chain.
-7. Track implementation manually even if coding happens in another tool;
-   delivery readiness and implementation completion are independent.
+7. Review/download the actual document in **Outputs**. Track report acceptance,
+   process changes or other follow-up work manually; output readiness is not proof
+   of achieved benefit.
 
 Analysis and builds poll every two seconds. Analysis errors are visible and
 retryable. Failed agent delivery is never marked ready. Mock quotes/signals and
@@ -85,13 +87,17 @@ Static HTML review is sandboxed and cannot run scripts or make network requests.
 | `POST /api/projects/{id}/context/file` | Multipart `file` |
 | `POST /api/projects/{id}/context/github` | `{url, ref?, token?}`; ephemeral read-only token |
 | `POST /api/projects/{id}/workshops` | `{title, notes?, scheduled_at?, meeting_url?}` |
-| `POST /api/projects/{id}/workshops/{sessionId}/transcript` | Multipart VTT/TXT `file`; save/replace without AI calls |
-| `DELETE /api/projects/{id}/workshops/{sessionId}/transcript` | Remove transcript, retain workshop/video/deliveries; invalidate old analysis |
+| `GET /api/projects/{id}/workshops/{sessionId}/transcripts` | List current named sources |
+| `POST /api/projects/{id}/workshops/{sessionId}/transcripts` | Multipart VTT/TXT `file`, optional `title`; add a source without AI calls; reject identical spoken-content copies with 409 |
+| `PUT /api/projects/{id}/workshops/{sessionId}/transcripts/{transcriptId}` | Replace only the selected source; invalidate analysis, preserve other sources and deliveries |
+| `DELETE /api/projects/{id}/workshops/{sessionId}/transcripts/{transcriptId}` | Remove only the selected source; retain workshop/video/deliveries |
+| `POST /api/projects/{id}/workshops/{sessionId}/transcript` | Compatibility alias for additive upload, not replacement |
+| `DELETE /api/projects/{id}/workshops/{sessionId}/transcript` | Compatibility singleton removal; 409 when multiple transcripts require an explicit ID |
 | `POST /api/projects/{id}/agenda` | Optional `{session_id}`; project or individual agenda |
-| `POST /api/projects/{id}/sessions` | Multipart `file`, `title`, optional `session_id`, optional `analyze` (`true` by default; UI sends `false` to save only). An MP4 can be added to a transcript-only workshop; existing video is never overwritten. Use the workshop transcript route to replace existing VTT/TXT. |
+| `POST /api/projects/{id}/sessions` | Multipart `file`, `title`, optional `session_id`, optional `analyze` (`true` by default; UI sends `false` to save only). VTT/TXT adds a source; MP4 preserves transcripts and never overwrites a video. Use the transcript item route for replacement. |
 | `POST /api/projects/{id}/analyze` | `{session_id}`; retry analysis |
 | `POST /api/projects/{id}/build` | `{candidate_id, expected_delivery_id?}`; explicitly request agents |
-| `POST /api/projects/{id}/approve` | `{candidate_id, delivery_mode: "PROMPTS" \| "PLAN", refinement?, expected_delivery_id?}` |
+| `POST /api/projects/{id}/approve` | `{candidate_id, delivery_mode: "REPORT" \| "RECOMMENDATION" \| "PROCESS" \| "GUIDE" \| "EXPERIMENT" \| "PROMPTS" \| "PLAN", refinement?, expected_delivery_id?}` |
 | `PATCH /api/projects/{id}/implementation` | `{candidate_id, implementation_status, implementation_notes, implementation_url}` |
 | `POST /api/projects/{id}/prompts` | `{candidate_id, target?: "prompt" \| "plan", refinement?}` |
 | `GET /api/projects/{id}/prompts?candidate_id=...&target=prompt` | Export the shared implementation prompt; also supports `plan` |
@@ -101,7 +107,25 @@ Prompt refinement is local mock templating, not paid LLM optimization.
 Legacy `copilot`/`claude` target aliases return the same tool-neutral prompt.
 Prompt delivery now writes one `implementation-prompt.md`, not duplicate exports.
 Future ChatGPT-assisted solution refinement is not activated by adding an API key.
+The five non-code output types produce standalone Markdown documents, not prompts.
+They are local template drafts with source excerpts in mock mode and structured
+OpenAI drafts in real mode. Output refinements scope that document, not the candidate
+set. No external research or independent source verification is performed.
+Documents label source-reported information, proposals and uncertainty. Unknown
+source references are rejected; provider failures do not fall back to demo content.
+Output provenance is persisted in `projects.delivery_generation_mode` and an
+immutable per-version `output-provenance.json`; switching to a local plan/prompt
+clears the current generation mode without rewriting historical metadata.
 Transcript saves use `pain_points_json: {status: "pending"}`; an explicit analyze
+action consumes every current source in the workshop. Workspace sessions expose
+`transcripts[]` with source IDs, names, filenames and original content.
+`transcript_vtt`, `transcript_path` and `transcript_filename` on the session are
+derived compatibility caches, not additional sources. Multi-source timestamps
+are local to their source; real pain points identify it with `transcript_id`.
+Multiple transcripts use text-only analysis rather than aligning independent
+clocks with one video's measured signals.
+
+An explicit analyze
 request transitions to `running`. Corrections clear the affected analysis and
 supersede candidates without deleting previous candidate/agent records.
 Explicit analysis can also update a previously analyzed workshop, except during
@@ -116,6 +140,11 @@ External implementation status is manual, not automatic GitHub synchronization.
 - `GET /capabilities` — current mode and provider/signal-service configuration
   booleans only; no secrets and no claim that real calls have succeeded
 - `POST /api/projects/{id}/generate-agenda` with optional `{session_id}`
+- `POST /api/projects/{id}/generate-output` with `{candidate_id, output_type, refinement?}`;
+  `output_type` is one of the five non-code types. Returns `{content, generation_mode,
+  source_ids, external_research: false}` without changing the decision or writing
+  files; the web transaction owns approval and versioned persistence. Input is
+  limited to 200,000 serialized characters; generation times out after 110 seconds.
 - `POST /api/projects/{id}/extract-context` with `{path}`
 - `POST /api/projects/{id}/analyze` with `{session_id}`
 - `POST /api/projects/{id}/build` with `{candidate_id}`

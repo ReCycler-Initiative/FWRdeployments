@@ -85,11 +85,11 @@ export function WorkshopPlanner({ id, workshops, enabled, mode, transcriptEnable
           <div className="min-w-0 flex-1"><h3>{workshop.title}</h3>
             <p className="mt-1 text-xs text-slate-500">{workshop.scheduled_at
               ? new Intl.DateTimeFormat(locale === "fi" ? "fi-FI" : "en-GB", { timeZone, dateStyle: "medium", timeStyle: "short" }).format(new Date(workshop.scheduled_at)) : t("Ajankohta sovitaan")}
-              {" · "}{workshop.processed_at ? t("Analysoitu") : workshop.video_path || workshop.transcript_path ? t("Aineisto lisätty") : workshop.agenda ? t("Runko valmis") : t("Suunnittelussa")}</p>
+              {" · "}{workshop.processed_at ? t("Analysoitu") : workshop.video_path || workshop.transcripts.length ? t("Aineisto lisätty") : workshop.agenda ? t("Runko valmis") : t("Suunnittelussa")}</p>
           </div></div>
         {workshop.notes && <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-slate-600">{workshop.notes}</p>}
         <div className="mt-4 flex flex-wrap gap-2">
-          {!workshop.video_path && !workshop.transcript_path && <button className="button-secondary" disabled={!enabled || !!busy} onClick={() => void agenda(workshop.id)}>
+          {!workshop.video_path && !workshop.transcripts.length && <button className="button-secondary" disabled={!enabled || !!busy} onClick={() => void agenda(workshop.id)}>
             {busy === workshop.id ? t("Generoidaan…") : mode === "mock" ? t("Generoi esimerkkirunko") : workshop.agenda ? t("Generoi runko uudelleen") : t("Generoi tämän työpajan runko")}</button>}
           {workshop.agenda && <button className="button-secondary" onClick={() => setOpenId(openId === workshop.id ? null : workshop.id)}>
             {openId === workshop.id ? t("Sulje työpajarunko") : t("Avaa työpajarunko")}</button>}

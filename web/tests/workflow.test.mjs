@@ -151,6 +151,105 @@ test("workshop material saves to the chosen workshop without analysis and preser
   }
 });
 
+test("non-code outputs create versioned source-referenced documents without starting coding agents", { timeout: 30000 }, async () => {
+  const base = process.env.TEST_WEB_URL;
+  assert.ok(base && process.env.DATABASE_URL && process.env.MEDIA_DIR && process.env.WORKER_URL);
+  assert.equal((await (await fetch(`${process.env.WORKER_URL}/health`)).json()).mock_ai, true);
+  const db = new Pool({ connectionString: process.env.DATABASE_URL });
+  let id;
+  const post = (body) => ({
+    method: "POST", headers: { "Content-Type": "application/json", Cookie: "frw_locale=en" }, body: JSON.stringify(body),
+  });
+  try {
+    const created = await fetch(`${base}/api/projects`, post({
+      title: "Investigate ownership", description: "Understand responsibility gaps before choosing any implementation.",
+      target_systems: ["Existing shared queue"], language: "en",
+    }));
+    assert.equal(created.status, 201);
+    id = (await created.json()).id;
+    const route = `${base}/api/projects/${id}`;
+    const source = await (await fetch(`${route}/context`, post({
+      filename: "Current situation", content_text: "Vastuun siirto kestää tunnin.",
+    }))).json();
+    const workshop = await (await fetch(`${route}/workshops`, post({ title: "Interviews" }))).json();
+    const transcript = new FormData();
+    transcript.set("file", new File(["No one owns the handover."], "interviews.txt"));
+    assert.equal((await fetch(`${route}/workshops/${workshop.id}/transcript`, { method: "POST", body: transcript })).status, 200);
+    const candidate = (await db.query(
+      `INSERT INTO solution_candidates(project_id,title,summary,solution_type,generation_mode,benefits,risks)
+       VALUES($1,'Clarify ownership','Investigate the gap before buying software.','PROCESS','mock',
+       '["Shared understanding"]','["Missing baseline"]') RETURNING id`, [id],
+    )).rows[0];
+    await db.query("UPDATE projects SET status='CANDIDATES_READY' WHERE id=$1", [id]);
+    let deliveryId;
+    const earlier = [];
+    for (const [mode, filename, expected] of [
+      ["REPORT", "report.md", /completed research finding/],
+      ["RECOMMENDATION", "recommendation.md", /decision criteria/],
+      ["PROCESS", "operating-model.md", /handovers and exceptions/],
+      ["GUIDE", "guide.md", /learning objective/],
+      ["EXPERIMENT", "experiment-plan.md", /success threshold, stop criteria/],
+    ]) {
+      if (mode === "RECOMMENDATION") {
+        assert.equal((await fetch(`${route}/approve`, post({ candidate_id: candidate.id, delivery_mode: mode }))).status, 409);
+      }
+      const approval = await fetch(`${route}/approve`, post({
+        candidate_id: candidate.id, delivery_mode: mode, refinement: "Confirm the accountable person.",
+        ...(deliveryId ? { expected_delivery_id: deliveryId } : {}),
+      }));
+      assert.equal(approval.status, 200, await approval.text());
+      const workspace = await (await fetch(route)).json();
+      assert.equal(workspace.project.status, "READY_FOR_REVIEW");
+      assert.equal(workspace.project.delivery_mode, mode);
+      assert.equal(workspace.project.delivery_generation_mode, "mock");
+      assert.equal(workspace.tasks.length, 0);
+      assert.equal(workspace.candidates[0].implementation_status, "NOT_STARTED");
+      assert.notEqual(workspace.project.active_delivery_id, deliveryId);
+      deliveryId = workspace.project.active_delivery_id;
+      const artifact = `delivery/${deliveryId}/${filename}`;
+      const content = (await (await fetch(`${route}/artifacts?path=${encodeURIComponent(artifact)}`)).json()).content;
+      assert.match(content, expected);
+      assert.match(content, /DEMO DRAFT/);
+      assert.match(content, /No external research or independent source verification/);
+      assert.match(content, /Vastuun siirto kestää tunnin/);
+      assert.match(content, /No one owns the handover/);
+      assert.match(content, /Confirm the accountable person/);
+      const metadata = JSON.parse(await readFile(path.join(process.env.MEDIA_DIR, id, "artifacts", "delivery", deliveryId, "output-provenance.json"), "utf8"));
+      assert.equal(metadata.external_research, false);
+      assert.equal(metadata.output_type, mode);
+      const savedWorkshop = workspace.sessions.find((session) => session.id === workshop.id);
+      assert.ok(metadata.source_ids.includes(`transcript:${savedWorkshop.transcripts[0].id}`));
+      earlier.push({ artifact, content });
+    }
+    const plan = await fetch(`${route}/approve`, post({
+      candidate_id: candidate.id, delivery_mode: "PLAN", expected_delivery_id: deliveryId,
+    }));
+    assert.equal(plan.status, 200);
+    const latest = await (await fetch(route)).json();
+    assert.equal(latest.project.delivery_generation_mode, null, "A local plan must not inherit AI/demo provenance from an earlier output");
+    const sourceId = source.id ?? (await db.query("SELECT id FROM context_documents WHERE project_id=$1", [id])).rows[0].id;
+    await db.query("UPDATE context_documents SET content_text=repeat('x',200001) WHERE id=$1", [sourceId]);
+    const failed = await fetch(`${route}/approve`, post({
+      candidate_id: candidate.id, delivery_mode: "REPORT", expected_delivery_id: latest.project.active_delivery_id,
+    }));
+    assert.equal(failed.status, 502);
+    const afterFailure = await (await fetch(route)).json();
+    assert.equal(afterFailure.project.active_delivery_id, latest.project.active_delivery_id);
+    assert.equal(afterFailure.project.delivery_mode, "PLAN");
+    assert.equal(afterFailure.artifacts.length, latest.artifacts.length);
+    assert.equal(Number((await db.query("SELECT count(*) FROM agent_tasks WHERE project_id=$1", [id])).rows[0].count), 0);
+    for (const previous of earlier) {
+      assert.equal((await (await fetch(`${route}/artifacts?path=${encodeURIComponent(previous.artifact)}`)).json()).content, previous.content);
+    }
+  } finally {
+    if (id) {
+      await db.query("DELETE FROM projects WHERE id=$1", [id]);
+      await rm(path.join(process.env.MEDIA_DIR, id), { recursive: true, force: true });
+    }
+    await db.end();
+  }
+});
+
 test("language preference, project content language and English exports remain independent", { timeout: 60000 }, async () => {
   const base = process.env.TEST_WEB_URL;
   assert.ok(base && process.env.DATABASE_URL && process.env.MEDIA_DIR && process.env.WORKER_URL);
@@ -472,7 +571,7 @@ test("mock workspace: preparation, upload, analysis, selection and four-agent de
     assert.equal(snapshot.sessions.length, 1);
     assert.equal(snapshot.sessions[0].id, plannedFirst.data.id);
     assert.equal(snapshot.sessions[0].agenda, firstAgenda.data.agenda);
-    assert.ok(snapshot.sessions[0].video_path.startsWith(path.join(process.env.MEDIA_DIR, id)));
+    assert.ok(snapshot.sessions[0].transcript_path.startsWith(path.join(process.env.MEDIA_DIR, id)));
     assert.ok(Array.isArray(snapshot.sessions[0].pain_points_json));
     assert.equal(snapshot.sessions[0].agenda_mode, "mock");
     assert.equal(snapshot.sessions[0].analysis_mode, "mock");
@@ -619,6 +718,141 @@ test("mock workspace: preparation, upload, analysis, selection and four-agent de
   }
 });
 
+test("multiple named transcripts add, deduplicate, analyze and change only the targeted source", { timeout: 60000 }, async () => {
+      const base = process.env.TEST_WEB_URL;
+      assert.ok(base && process.env.DATABASE_URL && process.env.MEDIA_DIR && process.env.WORKER_URL);
+      assert.equal((await (await fetch(`${process.env.WORKER_URL}/health`)).json()).mock_ai, true);
+      const db = new Pool({ connectionString: process.env.DATABASE_URL });
+      const projects = [];
+      const post = (body) => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      async function create(url, body) {
+        const response = await fetch(url, post(body));
+        const data = await response.json();
+        assert.ok(response.ok, JSON.stringify(data));
+        return data;
+      }
+      const material = (content, title, method = "POST", filename = "source.txt") => {
+        const form = new FormData();
+        form.set("file", new File([content], filename));
+        form.set("title", title);
+        return { method, body: form };
+      };
+      const firstText = "FIRST SOURCE & caf\u00e9";
+      const firstVtt = `WEBVTT\n\nNOTE This metadata is not spoken evidence.\n\ncue-1\n00:00:01.000 --> 00:00:04.000\n<v Alice>${firstText.replace("&", "&amp;")}</v>\n\n`;
+      try {
+        for (const title of ["Multiple transcript test", "Transcript isolation neighbor"]) {
+          projects.push((await create(`${base}/api/projects`, { title, description: "Isolated multiple transcript fixture", target_systems: [] })).id);
+        }
+        const [id, neighbor] = projects;
+        const route = `${base}/api/projects/${id}`;
+        const workshop = await create(`${route}/workshops`, { title: "Held workshop", notes: "Keep the workshop identity" });
+        const other = await create(`${route}/workshops`, { title: "Another workshop" });
+        const foreign = await create(`${base}/api/projects/${neighbor}/workshops`, { title: "Foreign workshop" });
+        const collection = `${route}/workshops/${workshop.id}/transcripts`;
+        const snapshot = async () => (await fetch(route)).json();
+        async function ready() {
+          for (let i = 0; i < 60; i++) {
+            const current = await snapshot();
+            assert.ok(!current.sessions.some((session) => session.pain_points_json?.error), JSON.stringify(current.sessions));
+            if (current.project.status === "CANDIDATES_READY") return current;
+            await new Promise((resolve) => setTimeout(resolve, 200));
+          }
+          assert.fail("Multiple transcript analysis did not finish");
+        }
+        const firstSave = await fetch(`${route}/workshops/${workshop.id}/transcript`, material(firstVtt, "Morning", "POST", "morning.vtt"));
+        assert.equal(firstSave.status, 200, "The singular compatibility route must add, not replace");
+        const firstId = (await firstSave.json()).transcript_id;
+        await create(`${route}/analyze`, { session_id: workshop.id });
+        let current = await ready();
+        await create(`${route}/approve`, { candidate_id: current.candidates[0].id, delivery_mode: "PROMPTS" });
+        current = await snapshot();
+        const delivery = current.project.active_delivery_id;
+        const artifact = current.artifacts[0].path;
+        const artifactFile = path.join(process.env.MEDIA_DIR, id, "artifacts", artifact);
+        const originalExport = await readFile(artifactFile, "utf8");
+        const secondUpload = material("SECOND ORIGINAL SOURCE", "Unused workshop rename");
+        secondUpload.body.set("session_id", workshop.id);
+        secondUpload.body.set("analyze", "false");
+        assert.equal((await fetch(`${route}/sessions`, secondUpload)).status, 201,
+          "The general upload route also adds to an existing workshop");
+        current = await snapshot();
+        let saved = current.sessions.find((session) => session.id === workshop.id);
+        assert.equal(saved.title, "Held workshop");
+        assert.equal(saved.transcripts.length, 2);
+        assert.equal(saved.processed_at, null);
+        assert.equal(saved.pain_points_json.status, "pending");
+        assert.equal(current.project.active_delivery_id, delivery);
+        assert.ok(current.candidates.every((candidate) => candidate.is_superseded));
+        const secondId = saved.transcripts.find((part) => part.id !== firstId).id;
+        const secondPath = saved.transcripts.find((part) => part.id === secondId).storage_path;
+        const firstPath = saved.transcripts.find((part) => part.id === firstId).storage_path;
+        assert.equal((await (await fetch(collection)).json()).transcripts.length, 2);
+        const duplicate = await fetch(collection, material("  FIRST SOURCE & cafe\u0301 \n", "Duplicate TXT"));
+        assert.equal(duplicate.status, 409, "Cue markup, metadata, whitespace and Unicode normalization must not hide a VTT/TXT copy");
+        assert.equal((await fetch(`${collection}/${firstId}`, material("SECOND ORIGINAL SOURCE", "Duplicate replacement", "PUT"))).status, 409);
+        assert.equal(await readFile(firstPath, "utf8"), firstVtt, "Rejected replacement leaves the original source untouched");
+        assert.equal((await fetch(`${route}/workshops/${workshop.id}/transcript`, { method: "DELETE" })).status, 409,
+          "Legacy removal must never delete a whole list");
+        assert.equal((await fetch(`${route}/workshops/${other.id}/transcripts`, material(firstVtt, "Independent source", "POST", "other.vtt"))).status, 200,
+          "The same spoken text remains valid in a different workshop");
+        assert.equal((await fetch(`${route}/workshops/${foreign.id}/transcripts`, material("Foreign", "Foreign"))).status, 404);
+        assert.equal((await fetch(`${route}/workshops/${other.id}/transcripts/${firstId}`, { method: "DELETE" })).status, 404);
+        const concurrent = await Promise.all([1, 2].map((index) => fetch(collection, material("CONCURRENT SOURCE", `Copy ${index}`))));
+        assert.deepEqual(concurrent.map((response) => response.status).sort(), [200, 409]);
+        saved = (await snapshot()).sessions.find((session) => session.id === workshop.id);
+        const concurrentPart = saved.transcripts.find((part) => part.content === "CONCURRENT SOURCE");
+        assert.equal(saved.transcripts.length, 3);
+        assert.equal((await fetch(`${collection}/${concurrentPart.id}`, { method: "DELETE" })).status, 200);
+        await db.query("UPDATE projects SET status='BUILDING' WHERE id=$1", [id]);
+        assert.equal((await fetch(collection, material("Blocked source", "Blocked"))).status, 409);
+        assert.equal((await fetch(`${collection}/${firstId}`, material("Blocked change", "Blocked", "PUT"))).status, 409);
+        assert.equal((await fetch(`${collection}/${firstId}`, { method: "DELETE" })).status, 409);
+        await db.query("UPDATE projects SET status='WORKSHOP_UPLOADED' WHERE id=$1", [id]);
+        await db.query("UPDATE sessions SET pain_points_json='{\"status\":\"running\"}' WHERE id=$1", [other.id]);
+        assert.equal((await fetch(collection, material("Blocked analysis source", "Blocked"))).status, 409);
+        assert.equal((await fetch(`${collection}/${firstId}`, { method: "DELETE" })).status, 409);
+        await db.query("UPDATE sessions SET pain_points_json=NULL WHERE id=$1", [other.id]);
+        await create(`${route}/analyze`, { session_id: workshop.id });
+        current = await ready();
+        saved = current.sessions.find((session) => session.id === workshop.id);
+        assert.ok(saved.transcript_vtt.includes(firstVtt));
+        assert.ok(saved.transcript_vtt.includes("SECOND ORIGINAL SOURCE"));
+        const prompt = await create(`${route}/prompts`, { candidate_id: current.candidates.find((candidate) => !candidate.is_superseded).id });
+        for (const part of saved.transcripts) {
+          assert.equal(prompt.prompt.split(`[transcript:${part.id}]`).length - 1, 1);
+        }
+        assert.equal((await fetch(`${collection}/${firstId}`, material("CORRECTED FIRST SOURCE", "Corrected morning", "PUT"))).status, 200);
+        saved = (await snapshot()).sessions.find((session) => session.id === workshop.id);
+        assert.equal(saved.transcripts.length, 2);
+        assert.equal(saved.transcripts.find((part) => part.id === firstId).title, "Corrected morning");
+        assert.equal(saved.transcripts.find((part) => part.id === secondId).content, "SECOND ORIGINAL SOURCE");
+        assert.ok(!saved.transcript_vtt.includes(firstText));
+        await assert.rejects(readFile(firstPath), { code: "ENOENT" });
+        const correctedPath = saved.transcripts.find((part) => part.id === firstId).storage_path;
+        assert.equal((await fetch(`${collection}/${firstId}`, { method: "DELETE" })).status, 200);
+        saved = (await snapshot()).sessions.find((session) => session.id === workshop.id);
+        assert.equal(saved.transcripts.length, 1);
+        assert.equal(saved.transcript_vtt, "SECOND ORIGINAL SOURCE");
+        assert.equal(saved.transcript_path, secondPath);
+        assert.equal(await readFile(secondPath, "utf8"), "SECOND ORIGINAL SOURCE");
+        await assert.rejects(readFile(correctedPath), { code: "ENOENT" });
+        assert.equal(await readFile(artifactFile, "utf8"), originalExport);
+        assert.equal((await snapshot()).project.active_delivery_id, delivery);
+        assert.equal((await fetch(`${route}/workshops/${workshop.id}/transcript`, { method: "DELETE" })).status, 200);
+        saved = (await snapshot()).sessions.find((session) => session.id === workshop.id);
+        assert.equal(saved.transcripts.length, 0);
+        assert.equal(saved.transcript_vtt, null);
+        assert.equal(saved.notes, "Keep the workshop identity");
+        assert.equal((await snapshot()).sessions.find((session) => session.id === other.id).transcripts.length, 1);
+      } finally {
+        for (const id of projects) {
+          await db.query("DELETE FROM projects WHERE id=$1", [id]);
+          await rm(path.join(process.env.MEDIA_DIR, id), { recursive: true, force: true });
+        }
+        await db.end();
+      }
+});
+
 test("workshop transcripts can be saved, corrected and removed without losing workshops or previous deliveries", { timeout: 60000 }, async () => {
   const base = process.env.TEST_WEB_URL;
   assert.ok(base && process.env.DATABASE_URL && process.env.MEDIA_DIR && process.env.WORKER_URL);
@@ -648,10 +882,11 @@ test("workshop transcripts can be saved, corrected and removed without losing wo
     }
     assert.fail("Transcript analysis did not finish");
   }
-  async function save(sessionId, text, filename = "workshop.vtt") {
+  async function save(sessionId, text, filename = "workshop.vtt", transcriptId) {
     const form = new FormData();
     form.set("file", new File([text], filename, { type: "text/vtt" }));
-    return fetch(`${base}/api/projects/${id}/workshops/${sessionId}/transcript`, { method: "POST", body: form });
+    return fetch(`${base}/api/projects/${id}/workshops/${sessionId}/transcripts${transcriptId ? `/${transcriptId}` : ""}`,
+      { method: transcriptId ? "PUT" : "POST", body: form });
   }
   const vtt = (text) => `WEBVTT\n\n00:00:01.000 --> 00:00:04.000\n${text}\n`;
   try {
@@ -673,6 +908,7 @@ test("workshop transcripts can be saved, corrected and removed without losing wo
     assert.equal(workshop.processed_at, null, "Saving must not automatically call AI");
     assert.equal(workshop.pain_points_json.status, "pending");
     const wrongPath = workshop.transcript_path;
+    const transcriptId = workshop.transcripts[0].id;
     assert.match(await readFile(wrongPath, "utf8"), /WRONG ORIGINAL/);
     await post(`/api/projects/${id}/analyze`, { session_id: first.id });
     current = await ready();
@@ -683,12 +919,14 @@ test("workshop transcripts can be saved, corrected and removed without losing wo
     const originalArtifact = current.artifacts[0].path;
     const originalContent = await readFile(path.join(process.env.MEDIA_DIR, id, "artifacts", originalArtifact), "utf8");
     assert.match(originalContent, /WRONG ORIGINAL TRANSCRIPT/);
-    assert.equal((await save(first.id, vtt("CORRECTED TRANSCRIPT"), "corrected.vtt")).status, 200);
+    assert.equal((await save(first.id, vtt("CORRECTED TRANSCRIPT"), "corrected.vtt", transcriptId)).status, 200);
     current = await workspace();
     workshop = current.sessions.find((session) => session.id === first.id);
     assert.equal(current.project.active_delivery_id, originalDelivery);
     assert.ok(current.candidates.every((candidate) => candidate.is_superseded));
     assert.equal(workshop.transcript_filename, "corrected.vtt");
+    assert.equal(workshop.transcripts.length, 1);
+    assert.equal(workshop.transcripts[0].id, transcriptId);
     assert.equal(workshop.agenda, originalAgenda);
     assert.equal(workshop.notes, "Keep these notes");
     assert.equal(workshop.scheduled_at, "2026-12-01T10:00:00.000Z");

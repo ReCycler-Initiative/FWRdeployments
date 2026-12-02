@@ -1,11 +1,11 @@
 # FRWDeployments
 
 A facilitated Forward Deployment workspace: turn context and multiple workshops
-into solution candidates, reviewable artifacts, implementation plans and
-ready-to-use GitHub Copilot or Claude prompts.
+into solution candidates, reports, decision recommendations, operating models,
+guidance and experiments, or software plans and prompts when appropriate.
 
-**An agent farm is optional, not the default outcome.** A reviewed live canvas,
-prompt package or implementation plan may be sufficient. Code generation starts
+**Solving the problem does not necessarily require code.** A reviewed report,
+recommendation or operational change may be the outcome. Code generation starts
 only when agent delivery is explicitly selected.
 
 ## Quick start
@@ -59,6 +59,12 @@ Migration 008 adds delivery versions. Legacy deliveries remain accessible withou
 inventing a version identifier; subsequent approvals use distinct version folders.
 Migration 009 adds per-workshop transcript file metadata and superseded candidates.
 Recognizable existing VTT/TXT uploads remain linked to their original workshops.
+Migration 010 adds non-code output types and their persisted generation provenance.
+Migration 011 adds multiple named transcripts per workshop and preserves existing
+saved transcripts as individual sources. Generated MP4 transcript caches are not
+mistaken for uploaded originals.
+Existing selections, delivery versions and artifacts are not relabeled or replaced.
+Restart the worker and web after upgrading to refresh schema-dependent queries.
 
 ## Finnish and English
 
@@ -92,13 +98,15 @@ the initial server-rendered timestamps use UTC to keep rendering consistent.
    Adding evidence only saves it; **Analyze workshop** is a separate action.
    A video can be added to a workshop that already has a transcript, without
    losing the transcript. Existing videos cannot be overwritten by this form.
-   Adding VTT/TXT to an existing workshop replaces its transcript with a warning.
+   Adding VTT/TXT creates an additional named source alongside existing transcripts.
+   Identical spoken content in VTT/TXT copies is rejected within the same workshop.
    Open a workshop's title in **Workshop history** to inspect its details,
    agenda and transcript controls without leaving the Workshop stage.
    **View this workshop's analysis** is a separate, explicit navigation action.
    Each new synthesis considers prior workshops and refreshes current candidates.
-   Each workshop also has **Add transcript**, **Replace transcript**, **View
-   transcript** and **Remove transcript** controls in Preparation and Workshop.
+   Each workshop lists its named transcripts with individual **Replace transcript**,
+   **View transcript** and confirmed **Remove transcript** controls. **Add transcript**
+   always adds a source rather than replacing one.
    Saving a VTT/TXT file makes no AI calls: choose **Analyze workshop** separately.
    You can correct an already held workshop, including after a delivery.
    Changes clear that workshop's previous analysis and mark existing proposals
@@ -108,6 +116,10 @@ the initial server-rendered timestamps use UTC to keep rendering consistent.
    Changes are blocked while an analysis or agent build is running.
    Explicit reanalysis creates current proposals while keeping previous decisions,
    agent logs and delivery files. Outdated proposals cannot be approved again.
+   All current transcripts are analyzed together; exports include each source once.
+   Timestamps remain local to each transcript, and written outputs cite individual
+   transcript IDs. With multiple transcripts, video signal fusion is disabled:
+   independently timed sources cannot safely be aligned to one recording.
 6. **Review solutions:** inspect timestamped pain points, quotes, intensity and
    the Mermaid current-state process. Compare three candidates by benefits,
    risks, architecture and recorded provenance. Solution prices are not generated
@@ -128,8 +140,17 @@ the initial server-rendered timestamps use UTC to keep rendering consistent.
    included as original source material, with provenance warnings on analysis.
    ChatGPT-assisted improvement of the solution set before export is a future
    feature, not the current local template refinement; a key alone cannot enable it.
-9. **Approve a candidate and choose sufficient delivery:**
-   - **Implementation prompt** (default): persist one tool-neutral Markdown prompt,
+9. **Approve a candidate and choose an output:**
+   - **Report** (default): investigation scope, supplied evidence, information gaps
+     and further verification.
+   - **Decision recommendation:** alternatives, criteria, conditions and open questions.
+   - **Operating model or process description:** triggers, roles, steps, handovers
+     and exception handling.
+   - **Guidance or training material:** audience, learning goals, practical steps
+     and comprehension checks.
+   - **Experiment plan:** hypothesis, baseline collection, measures, success and
+     stop criteria, safeguards and review decision.
+   - **Implementation prompt:** persist one tool-neutral Markdown prompt,
      without starting agents.
    - **Implementation plan:** deliver scope, milestones, decision gates, risks
      and acceptance criteria, without automatic coding.
@@ -137,16 +158,45 @@ the initial server-rendered timestamps use UTC to keep rendering consistent.
      (`architect → coder → data → qa`) produces reviewable draft artifacts.
      Tasks, logs and canvas refresh every two seconds.
 
-Prompt and plan deliveries go directly to `READY_FOR_REVIEW`. Agent delivery
+The final workspace stage is **Outputs**, not an obligatory agent farm.
+Written outputs, prompts and plans go directly to `READY_FOR_REVIEW`. Agent delivery
 passes through `BUILDING`. Approval stores the current refinements in immutable
 delivery files; subsequent canvas drafts do not replace those accepted exports.
 Previously accepted files are retained unchanged, including any historical content.
 New prompt/plan exports contain provenance notices and no generated budget section.
 
+### Written outputs and source boundaries
+
+Reports and the other non-code outputs are standalone Markdown documents, not
+instructions for another coding agent. Preview or download them in **Outputs**.
+In demo mode they are explicitly local template drafts containing excerpts from
+the supplied material. With `MOCK_AI=false`, the worker uses structured OpenAI
+generation and the project content language; this may incur API charges.
+
+Each document distinguishes source-reported information, proposals and uncertainty,
+and includes a source appendix. References must resolve to supplied source IDs.
+Evidence is the project description, context documents, saved transcripts and
+workshop notes; simulated analysis is not treated as fact. Mock-generated video
+transcripts are excluded unless a separate saved transcript exists.
+
+**No external research or independent fact-checking is performed.** Imported URLs
+are source metadata, not proof of verification. Even real AI drafts require human
+source and conclusion review. Unknown owners, deadlines and measured results must
+remain open questions. Adding an API key alone does not produce a verified study.
+
+Output scope/refinements apply to document generation; improving the underlying
+solution candidate set through conversational ChatGPT remains a future feature.
+Written generation has a 200,000-character serialized input limit and a 110-second
+timeout. Failures are explicit and preserve the previous accepted delivery.
+Every written delivery includes `output-provenance.json` with its type, generation
+mode, source identifiers and `external_research: false`. Earlier versions remain
+unchanged. No coding agents start and solution progress is not automatically
+marked complete.
+
 ### Compare alternatives and change an approved selection
 
 The canvas selector changes only what is being reviewed, not the approved solution.
-Use **Compare alternatives or change selection** in Delivery to return to Solutions.
+Use **Compare alternatives or change selection** in Outputs to return to Solutions.
 Choose an outcome, then **Switch to this solution** on an alternative card (or
 **Change outcome** on the current solution). A confirmation shows the new candidate
 and outcome before anything changes. Canceling leaves the decision untouched.
@@ -163,11 +213,11 @@ Agent logs remain stored; the Kanban shows only the active delivery's four tasks
 Returning to a previously selected candidate creates a new run without overwriting
 its earlier files. Repeating the same active approval does not create duplicates.
 
-### Track implementation outside the workspace
+### Track solution progress
 
 Candidates may be **technical**, **process improvements** or **hybrid**.
-Solutions remains the coordination view when implementation happens in Copilot,
-Claude or the customer's own team.
+Solutions remains the coordination view for report acceptance, operational changes,
+experiments or implementation in the customer's own team or development tools.
 
 The selected candidate has an independent implementation status:
 
@@ -177,8 +227,8 @@ NOT_STARTED → IN_PROGRESS → IN_REVIEW → COMPLETED
                BLOCKED
 ```
 
-Update status, progress notes and a GitHub repository/issue/PR link in Solutions
-or Delivery. **A prompt package can be ready while implementation has not started.**
+Update status, progress notes and an output or follow-up link in Solutions
+or Outputs. **A draft can be ready while review or operational changes have not started.**
 Agent delivery moves implementation to `IN_PROGRESS`, then `IN_REVIEW`; only
 a person marks it complete. GitHub progress is not synchronized automatically.
 
@@ -221,7 +271,7 @@ Old demo outputs remain demos; explicitly regenerate them after configuration
 `MOCK_AI=false` uses:
 
 - `OPENAI_API_KEY` and `OPENAI_MODEL` (default `gpt-4o-mini`) for structured
-  agendas, synthesis and LangGraph role outputs.
+  agendas, synthesis, written non-code outputs and LangGraph role outputs.
 - `WHISPER_MODEL` (default `whisper-1`) for MP4 audio extraction using ffmpeg
   and Whisper transcription with segment timestamps.
 - `SIGNALS_API_URL` and optional `SIGNALS_API_KEY` for a separately implemented

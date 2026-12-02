@@ -49,22 +49,31 @@ async def generate_agenda(settings: Settings, context: dict) -> str:
 
 async def synthesize(settings: Settings, context: dict, transcript: str, signal_result: SignalResult) -> Synthesis:
     if not settings.mock_ai:
-        return await structured(
+        result = await structured(
             settings, Synthesis,
             "Return exactly three solution candidates with string-array benefits/risks and concrete "
             "architecture specifications. Do not generate prices, budgets or cost estimates. "
-            "Classify each solution_type as TECHNICAL, PROCESS or HYBRID. Consider a non-code "
-            "process change when it solves the need: an agent farm is never mandatory. "
+            "Classify each solution_type as TECHNICAL, PROCESS or HYBRID. Consider an investigation, "
+            "decision recommendation, operating model, guidance or experiment when appropriate. "
+            "Describe the proposed approach in architecture_spec even when no software is needed. "
+            "A process change may solve the need: an agent farm is never mandatory. "
             "Return a Mermaid flowchart of the current process. Pain-point quotes must be verbatim transcript evidence, "
             "with timestamps; emotions are tentative signal-based interpretations. Explicitly "
             "state uncertainty and signal limitations in descriptions. Do not invent quotes. "
             "Previous analytical findings are unverified: ignore simulated findings and use original "
             "transcripts/documents as evidence, not previous AI conclusions. "
             "Consider all previous workshops when proposing solutions. For plain TXT input "
-            "explicitly label timestamps as estimated; never pretend audio or face signals exist.",
+            "explicitly label timestamps as estimated; never pretend audio or face signals exist. "
+            "When analysis_transcripts is provided, each pain point must set transcript_id to a listed source ID. "
+            "Each transcript has its own local clock; never merge timestamps into one video clock. "
+            "Use the transcript headings to associate evidence with its source.",
             {**context, "transcript_vtt": transcript, "signal_fusion": signal_result.model_dump()},
             language=context["project"].get("language", "fi"),
         )
+        sources = {str(part["id"]) for part in context.get("analysis_transcripts", [])}
+        if sources and any(str(point.transcript_id) not in sources for point in result.pain_points):
+            raise ValueError("Pain points must reference an active transcript from this workshop")
+        return result
     if context["project"].get("language") == "en":
         return Synthesis(
             pain_points=[

@@ -69,6 +69,9 @@ export async function getWorkspace(id: string): Promise<StoredWorkspace | null> 
     const sessions = await client.query(
       "SELECT * FROM sessions WHERE project_id = $1 ORDER BY COALESCE(uploaded_at, created_at) DESC, id", [id],
     );
+    const transcripts = await client.query(
+      "SELECT * FROM workshop_transcripts WHERE project_id=$1 ORDER BY created_at,id", [id],
+    );
     const candidates = await client.query(
       `SELECT * FROM solution_candidates WHERE project_id = $1 AND (NOT is_superseded OR is_selected)
        ORDER BY CASE solution_type WHEN 'PROCESS' THEN 0 WHEN 'TECHNICAL' THEN 1 ELSE 2 END, id`, [id],
@@ -83,7 +86,9 @@ export async function getWorkspace(id: string): Promise<StoredWorkspace | null> 
     return {
       project: projectSchema.parse(projectResult.rows[0]),
       documents: documents.rows.map((row) => contextDocumentSchema.parse(row)),
-      sessions: sessions.rows.map((row) => sessionSchema.parse(row)),
+      sessions: sessions.rows.map((row) => sessionSchema.parse({
+        ...row, transcripts: transcripts.rows.filter((transcript) => transcript.session_id === row.id),
+      })),
       candidates: candidates.rows.map((row) => candidateSchema.parse(row)),
       tasks: tasks.rows.map((row) => agentTaskSchema.parse(row)),
     };

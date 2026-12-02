@@ -34,26 +34,26 @@ export function ImplementationTracker({ id, candidate, locked, onSaved }: {
         }), method: "PATCH",
       }, z.unknown());
       await onSaved();
-      setNotice(t("Ratkaisun toteutustila on päivitetty. Promptipaketin toimitustila säilyy erillisenä."));
+      setNotice(t("Ratkaisun eteneminen on päivitetty. Tuotoksen valmistuminen säilyy erillisenä tietona."));
     } catch (error) {
       setError(error instanceof Error ? error.message : t("Toteutustilan päivitys epäonnistui."));
     } finally { setBusy(false); }
   }
   return <section className="panel space-y-5">
-    <div><p className="eyebrow">{t("Ratkaisun toteutuksen seuranta")}</p><h2>{candidate.title}</h2>
-      <p className="subtitle">{t("Toteutus voi tapahtua GH Copilotissa, Claudessa tai omassa tiimissä. Päivitä sen tila täällä käsin. Valmis prompti tai suunnitelma ei tarkoita valmista ratkaisua.")}</p></div>
+    <div><p className="eyebrow">{t("Ratkaisun etenemisen seuranta")}</p><h2>{candidate.title}</h2>
+      <p className="subtitle">{t("Seuraa selvityksen hyväksyntää, toimintatavan muutosta tai muuta jatkotyötä käsin. Valmis luonnos ei vielä osoita, että tavoiteltu hyöty on toteutunut.")}</p></div>
     <div className="flex flex-wrap gap-2"><span className="system-tag">{t(solutionTypeLabels[candidate.solution_type])}</span>
       <span className="status-badge">{t(implementationLabels[candidate.implementation_status])}</span></div>
     <form method="post" className="space-y-4" onSubmit={submit} key={`${candidate.id}/${candidate.implementation_updated_at}`}>
-      <label>{t("Toteutuksen tila")}<select name="status" defaultValue={candidate.implementation_status} disabled={locked || busy}>
+      <label>{t("Ratkaisun tila")}<select name="status" defaultValue={candidate.implementation_status} disabled={locked || busy}>
         {Object.entries(implementationLabels).map(([value, label]) => <option key={value} value={value}>{t(label)}</option>)}
       </select></label>
-      <label>{t("GitHub-repo, issue tai pull request")}<input name="url" type="url" defaultValue={candidate.implementation_url ?? ""} placeholder="https://github.com/organisaatio/repo/pull/123" maxLength={1000} disabled={locked || busy} /></label>
+      <label>{t("Linkki tuotokseen tai jatkotyöhön")}<input name="url" type="url" defaultValue={candidate.implementation_url ?? ""} placeholder="https://..." maxLength={1000} disabled={locked || busy} /></label>
       <label>{t("Edistyminen, esteet ja seuraavat askeleet")}<textarea name="notes" rows={4} maxLength={10000} defaultValue={candidate.implementation_notes} disabled={locked || busy} /></label>
-      <button className="button-primary" disabled={locked || busy}>{busy ? t("Tallennetaan…") : t("Päivitä toteutuksen tila")}</button>
+      <button className="button-primary" disabled={locked || busy}>{busy ? t("Tallennetaan…") : t("Päivitä ratkaisun tila")}</button>
       <p className="field-hint">{locked ? t("Agentit päivittävät tilaa ketjun aikana. Manuaalinen katselmointi onnistuu sen jälkeen.") : t("Manuaalinen seuranta: GitHub-linkki ei vielä synkronoi issueiden tai PR:ien tilaa automaattisesti.")}</p>
     </form>
-    {candidate.implementation_url && <a className="button-secondary" href={candidate.implementation_url} target="_blank" rel="noopener noreferrer">{t("Avaa toteutus GitHubissa ↗")}</a>}
+    {candidate.implementation_url && <a className="button-secondary" href={candidate.implementation_url} target="_blank" rel="noopener noreferrer">{t("Avaa tuotos tai jatkotyö ↗")}</a>}
     {error && <p className="error-message" role="alert">{error}</p>}
     {notice && <p className="notice" role="status">{notice}</p>}
   </section>;

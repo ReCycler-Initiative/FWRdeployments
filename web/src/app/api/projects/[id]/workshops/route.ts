@@ -27,7 +27,7 @@ export async function POST(request: Request, context: ProjectRoute) {
         "INSERT INTO sessions (project_id,title,notes,scheduled_at,meeting_url) VALUES ($1,$2,$3,$4,$5) RETURNING *",
         [id, input.title, input.notes, input.scheduled_at, input.meeting_url || null],
       );
-      return sessionSchema.parse(result.rows[0]);
+      return sessionSchema.parse({ ...result.rows[0], transcripts: [] });
     });
     return Response.json(workshop, { status: 201 });
   });

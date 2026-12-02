@@ -36,7 +36,8 @@ async def signals(
             baseline_method="SIMULOITU esimerkkikalibrointi, ei videosta mitattu",
             limitations="Kaikki signaalit ja lainaukset ovat kuvitteellisia demoarvoja.",
         )
-    if not session.get("video_path") or not session["video_path"].lower().endswith(".mp4"):
+    if (len(session.get("transcripts") or []) > 1
+            or not session.get("video_path") or not session["video_path"].lower().endswith(".mp4")):
         if language == "en":
             return SignalResult(
                 signals=[],

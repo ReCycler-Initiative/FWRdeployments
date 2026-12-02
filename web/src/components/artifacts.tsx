@@ -39,8 +39,8 @@ export function Artifacts({ id, files, activeDeliveryId }: { id: string; files: 
   }
 
   return <section className="panel">
-    <p className="eyebrow">{t("Toteutuksen tuotokset")}</p><h2>{t("Artefaktit ja esikatselu")}</h2>
-    <p className="subtitle mb-5">{t("Generoitua koodia ei suoriteta automaattisesti. Katselmoi tiedostot ennen käyttöä.")}</p>
+    <p className="eyebrow">{t("Valitun ratkaisun tuotokset")}</p><h2>{t("Tuotokset ja esikatselu")}</h2>
+    <p className="subtitle mb-5">{t("Avaa selvitys, ohje tai muu tuotos esikatseluun tai lataa tiedosto. Katselmoi sisältö ennen käyttöä; mahdollista koodia ei suoriteta automaattisesti.")}</p>
     {!currentFiles.length && <p className="notice">{t("Nykyisen toimituksen tiedostot ilmestyvät tähän niiden valmistuessa.")}</p>}
     {fileList(currentFiles)}
     {previousFiles.length > 0 && <details className="mt-5"><summary>{t("Aiemmat toimitukset")} ({previousFiles.length})</summary>
@@ -57,7 +57,11 @@ export function Artifacts({ id, files, activeDeliveryId }: { id: string; files: 
           className="prototype-preview"
           srcDoc={`<!doctype html><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'none'; base-uri 'none';">${preview.content}`} />
       </div>}
-      <details className="mt-3" open={!/\.html?$/i.test(preview.path)}><summary>{t("Tiedoston lähdekoodi")}</summary><pre className="agent-log">{preview.content}</pre></details>
+      <details className="mt-3" open={!/\.html?$/i.test(preview.path)}>
+        <summary>{/\.md$/i.test(preview.path) ? t("Dokumentin sisältö") : t("Tiedoston lähdekoodi")}</summary>
+        <pre className={/\.md$/i.test(preview.path)
+          ? "mt-3 max-h-[70vh] overflow-auto whitespace-pre-wrap break-words rounded-lg border border-slate-200 bg-slate-50 p-5 font-sans text-sm leading-7"
+          : "agent-log"}>{preview.content}</pre></details>
     </div>}
   </section>;
 }

@@ -17,7 +17,35 @@ class BuildRequest(StrictModel):
     expected_delivery_id: UUID | None = None
 
 
+OutputType = Literal["REPORT", "RECOMMENDATION", "PROCESS", "GUIDE", "EXPERIMENT"]
+
+
+class OutputRequest(StrictModel):
+    candidate_id: UUID
+    output_type: OutputType
+    refinement: str = Field(default="", max_length=5000)
+
+
+class OutputSection(StrictModel):
+    heading: str = Field(min_length=1, max_length=200)
+    body: str = Field(min_length=1, max_length=100000)
+    kind: Literal["evidence", "proposal", "uncertainty"]
+    source_ids: list[str]
+
+
+class WrittenOutput(StrictModel):
+    sections: list[OutputSection] = Field(min_length=2, max_length=12)
+
+
+class GeneratedOutput(StrictModel):
+    content: str = Field(min_length=20, max_length=250000)
+    generation_mode: Literal["mock", "ai"]
+    external_research: Literal[False] = False
+    source_ids: list[str]
+
+
 class PainPoint(StrictModel):
+    transcript_id: UUID | None = None
     timestamp_seconds: float = Field(ge=0, allow_inf_nan=False)
     emotion: str = Field(min_length=1)
     intensity: float = Field(ge=0, le=1, allow_inf_nan=False)

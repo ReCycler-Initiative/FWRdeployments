@@ -8,6 +8,7 @@ import {
 import { getDatabase, transaction } from "@/lib/db";
 import { projectMedia } from "@/lib/media";
 import { readWorkshopFile } from "@/lib/workshop-files";
+import { insertTranscript, syncWorkshopTranscripts } from "@/lib/workshop-transcripts";
 
 const maxBytes = 100 * 1024 * 1024;
 
@@ -25,7 +26,7 @@ export async function POST(request: Request, context: ProjectRoute) {
     const { bytes, extension, transcript, filename: originalName } = await readWorkshopFile(form.get("file"));
     const sessionId = workshopId ?? randomUUID();
     const directory = projectMedia(id);
-    const filename = path.join(directory, `${sessionId}${extension}`);
+    const filename = path.join(directory, `${sessionId}-${randomUUID()}${extension}`);
     let written = false;
     try {
       await transaction(async (client) => {
@@ -40,9 +41,6 @@ export async function POST(request: Request, context: ProjectRoute) {
         if (workshopId) {
           const workshop = await client.query("SELECT video_path, transcript_path FROM sessions WHERE id=$1 AND project_id=$2 FOR UPDATE", [workshopId, id]);
           if (!workshop.rows[0]) throw new ApiError(404, "Työpaja ei kuulu projektiin.");
-          if (transcript && (workshop.rows[0].video_path || workshop.rows[0].transcript_path)) {
-            throw new ApiError(409, "Tähän työpajaan on jo liitetty tallenne.");
-          }
           if (!transcript && workshop.rows[0].video_path?.toLowerCase().endsWith(".mp4")) {
             throw new ApiError(409, "Työpajalle on jo lisätty video.");
           }
@@ -52,20 +50,18 @@ export async function POST(request: Request, context: ProjectRoute) {
         written = true;
         if (workshopId) {
           await client.query(
-            `UPDATE sessions SET video_path=$2,
-             transcript_vtt=COALESCE($3,transcript_vtt), transcript_path=COALESCE($4,transcript_path),
-             transcript_filename=COALESCE($5,transcript_filename), uploaded_at=now(),
-             processed_at=NULL, pain_points_json=NULL, current_state_mermaid=NULL, analysis_mode=NULL WHERE id=$1`,
-            [workshopId, filename, transcript, transcript ? filename : null, transcript ? originalName : null]);
+            "UPDATE sessions SET video_path=CASE WHEN $3::boolean THEN $2 ELSE video_path END WHERE id=$1",
+            [workshopId, filename, !transcript]);
         } else {
           await client.query(
-            `INSERT INTO sessions (id, project_id, video_path, transcript_vtt, title, transcript_path, transcript_filename, uploaded_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, now())`,
-            [sessionId, id, filename, transcript, title, transcript ? filename : null, transcript ? originalName : null],
+            "INSERT INTO sessions(id,project_id,video_path,title) VALUES($1,$2,$3,$4)",
+            [sessionId, id, transcript ? null : filename, title],
           );
         }
-        await client.query("UPDATE projects SET status = 'WORKSHOP_UPLOADED' WHERE id = $1", [id]);
-        await client.query("UPDATE solution_candidates SET is_superseded=true WHERE project_id=$1", [id]);
+        if (transcript) await insertTranscript(client, id, sessionId, {
+          title: originalName, filename: originalName, storage_path: filename, content: transcript,
+        });
+        await syncWorkshopTranscripts(client, id, sessionId);
       });
     } catch (error) {
       if (written) await unlink(filename);
@@ -77,7 +73,7 @@ export async function POST(request: Request, context: ProjectRoute) {
     } catch (error) {
       const message = error instanceof ApiError ? error.message : "Analyysin käynnistys epäonnistui.";
       await getDatabase().query(
-        "UPDATE sessions SET pain_points_json = $2::jsonb WHERE id = $1 AND processed_at IS NULL AND pain_points_json IS NULL",
+        "UPDATE sessions SET pain_points_json = $2::jsonb WHERE id = $1 AND processed_at IS NULL AND (pain_points_json IS NULL OR pain_points_json->>'status'='pending')",
         [sessionId, JSON.stringify({ error: message })],
       );
       throw error;

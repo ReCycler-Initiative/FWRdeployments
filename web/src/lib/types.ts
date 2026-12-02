@@ -21,6 +21,9 @@ export const aiCapabilitiesSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("unavailable") }),
 ]);
 export type AiCapabilities = z.infer<typeof aiCapabilitiesSchema>;
+export const writtenOutputModeSchema = z.enum(["REPORT", "RECOMMENDATION", "PROCESS", "GUIDE", "EXPERIMENT"]);
+export type WrittenOutputMode = z.infer<typeof writtenOutputModeSchema>;
+export const deliveryModeSchema = z.enum([...writtenOutputModeSchema.options, "PROMPTS", "PLAN", "AGENTS"]);
 const timestamp = z.union([z.date(), z.string()]).transform((value) =>
   value instanceof Date ? value.toISOString() : value,
 );
@@ -35,7 +38,8 @@ export const projectSchema = z.object({
   workshop_agenda: z.string().nullable(),
   agenda_mode: generationModeSchema.nullable(),
   active_delivery_id: uuid.nullable(),
-  delivery_mode: z.enum(["PROMPTS", "PLAN", "AGENTS"]).nullable(),
+  delivery_mode: deliveryModeSchema.nullable(),
+  delivery_generation_mode: generationModeSchema.nullable(),
   created_at: timestamp,
   updated_at: timestamp,
 });
@@ -55,12 +59,26 @@ export const contextDocumentSchema = z.object({
   created_at: timestamp,
 });
 export const painPointSchema = z.object({
+  transcript_id: uuid.nullable().optional(),
   timestamp_seconds: z.number().nonnegative(),
   emotion: z.string(),
   intensity: z.number().min(0).max(1),
   quote: z.string(),
   description: z.string(),
 });
+export const workshopTranscriptSchema = z.object({
+  id: uuid,
+  project_id: uuid,
+  session_id: uuid,
+  title: z.string(),
+  filename: z.string(),
+  storage_path: z.string().nullable(),
+  content: z.string(),
+  content_hash: z.string(),
+  created_at: timestamp,
+  updated_at: timestamp,
+});
+export type WorkshopTranscriptRecord = z.infer<typeof workshopTranscriptSchema>;
 export const sessionSchema = z.object({
   id: uuid,
   project_id: uuid,
@@ -68,6 +86,7 @@ export const sessionSchema = z.object({
   transcript_vtt: z.string().nullable(),
   transcript_path: z.string().nullable(),
   transcript_filename: z.string().nullable(),
+  transcripts: z.array(workshopTranscriptSchema),
   pain_points_json: z.union([
     z.array(painPointSchema),
     z.object({ error: z.string() }),

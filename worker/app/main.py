@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -108,15 +108,16 @@ async def locked_project(connection, project_id: UUID) -> dict:
     return project
 
 
-async def context_for(connection, project: dict) -> dict:
+async def context_for(connection, project: dict, analysis_session_id: UUID | None = None) -> dict:
     documents = await (await connection.execute(
         """SELECT filename, content_text FROM context_documents
            WHERE project_id = %s ORDER BY created_at, id""", (project["id"],)
     )).fetchall()
     workshops = await (await connection.execute(
-        """SELECT id, title, transcript_vtt, pain_points_json, current_state_mermaid, processed_at
-           FROM sessions WHERE project_id = %s AND processed_at IS NOT NULL
-           ORDER BY created_at, id""", (project["id"],)
+        """SELECT id, title, transcript_vtt, pain_points_json, current_state_mermaid, processed_at, analysis_mode
+           FROM sessions WHERE project_id = %s AND id IS DISTINCT FROM %s
+           AND (processed_at IS NOT NULL OR (%s::uuid IS NOT NULL AND transcript_vtt IS NOT NULL))
+           ORDER BY created_at, id""", (project["id"], analysis_session_id, analysis_session_id)
     )).fetchall()
     return {"project": project, "documents": documents, "previous_workshops": workshops}
 
@@ -137,6 +138,14 @@ async def health() -> dict:
     async with pool.connection() as connection:
         await connection.execute("SELECT 1")
     return {"status": "ok", "database": "ok", "mock_ai": settings.mock_ai}
+
+@app.get("/capabilities")
+async def capabilities() -> dict:
+    return {
+        "mode": "mock" if settings.mock_ai else "ai",
+        "openai_configured": bool(settings.openai_api_key.get_secret_value()),
+        "video_signals_configured": bool(settings.signals_api_url),
+    }
 
 
 class AgendaRequest(BaseModel):
@@ -169,10 +178,14 @@ async def agenda(project_id: UUID, body: AgendaRequest | None = None) -> dict:
                 logger.exception("Agenda generation failed for %s", project_id)
                 raise HTTPException(502, f"Agenda generation failed: {failure_detail(exc)}") from exc
             await connection.execute(
-                "UPDATE projects SET workshop_agenda = %s WHERE id = %s", (text, project_id)
+                "UPDATE projects SET workshop_agenda = %s, agenda_mode = %s WHERE id = %s",
+                (text, "mock" if settings.mock_ai else "ai", project_id),
             )
             if workshop_id:
-                await connection.execute("UPDATE sessions SET agenda=%s WHERE id=%s", (text, workshop_id))
+                await connection.execute(
+                    "UPDATE sessions SET agenda=%s, agenda_mode=%s WHERE id=%s",
+                    (text, "mock" if settings.mock_ai else "ai", workshop_id),
+                )
     return {"agenda": text}
 
 
@@ -187,24 +200,23 @@ async def analyze(project_id: UUID, body: AnalyzeRequest) -> dict:
             )).fetchone()
             if not session:
                 raise HTTPException(404, "Session not found in this project")
-            if (project["status"] == "CANDIDATES_READY" and session["processed_at"]
-                    and isinstance(session["pain_points_json"], list)):
-                return ACCEPTED
-            if project["status"] != "WORKSHOP_UPLOADED":
-                raise HTTPException(409, "Analysis requires WORKSHOP_UPLOADED")
+            if project["status"] == "BUILDING":
+                raise HTTPException(409, "Transkriptiota ei voi muuttaa analyysin tai agenttityön aikana.")
             active = await (await connection.execute(
                 """SELECT id FROM sessions WHERE project_id = %s
                    AND pain_points_json->>'status' = 'running'""", (project_id,)
             )).fetchone()
             if active:
                 raise HTTPException(409, "An analysis is already running for this project")
-            if session["processed_at"] and isinstance(session["pain_points_json"], list):
-                raise HTTPException(409, "This session is already analyzed")
+            if not session["video_path"] and not session["transcript_path"]:
+                raise HTTPException(409, "Työpajalle on ensin lisättävä tallenne tai transkriptio.")
             real_config(video=bool(session["video_path"] and session["video_path"].lower().endswith(".mp4")))
-            context = await context_for(connection, project)
+            context = await context_for(connection, project, body.session_id)
+            await connection.execute("UPDATE projects SET status='WORKSHOP_UPLOADED' WHERE id=%s", (project_id,))
+            await connection.execute("UPDATE solution_candidates SET is_superseded=true WHERE project_id=%s", (project_id,))
             await connection.execute(
                 """UPDATE sessions SET pain_points_json = %s, processed_at = NULL,
-                   current_state_mermaid = NULL WHERE id = %s""",
+                   current_state_mermaid = NULL, analysis_mode = NULL WHERE id = %s""",
                 (Jsonb({"status": "running"}), body.session_id),
             )
     enqueue(analysis_job(project_id, body.session_id, session, context))
@@ -259,21 +271,22 @@ async def analysis_job(project_id: UUID, session_id: UUID, session: dict, contex
                         raise ValueError("Project state changed during analysis")
                     await connection.execute(
                         """UPDATE sessions SET transcript_vtt = %s, pain_points_json = %s,
-                           current_state_mermaid = %s, processed_at = now() WHERE id = %s AND project_id = %s""",
+                           current_state_mermaid = %s, analysis_mode = %s, processed_at = now()
+                           WHERE id = %s AND project_id = %s""",
                         (transcript, Jsonb([p.model_dump() for p in result.pain_points]),
-                         result.current_state_mermaid, session_id, project_id),
+                         result.current_state_mermaid, "mock" if settings.mock_ai else "ai", session_id, project_id),
                     )
                     await connection.execute(
-                        "DELETE FROM solution_candidates WHERE project_id = %s", (project_id,)
+                        "UPDATE solution_candidates SET is_superseded=true WHERE project_id = %s", (project_id,)
                     )
                     for candidate in result.candidates:
                         await connection.execute(
                             """INSERT INTO solution_candidates
-                               (project_id, title, summary, benefits, risks, estimated_cost, architecture_spec, solution_type)
+                               (project_id, title, summary, benefits, risks, architecture_spec, solution_type, generation_mode)
                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
                             (project_id, candidate.title, candidate.summary,
                              Jsonb(candidate.benefits), Jsonb(candidate.risks),
-                             candidate.estimated_cost, candidate.architecture_spec, candidate.solution_type),
+                             candidate.architecture_spec, candidate.solution_type, "mock" if settings.mock_ai else "ai"),
                         )
                     await connection.execute(
                         "UPDATE projects SET status = 'CANDIDATES_READY' WHERE id = %s", (project_id,)
@@ -299,13 +312,24 @@ async def build(project_id: UUID, body: BuildRequest) -> dict:
             )).fetchone()
             if not candidate:
                 raise HTTPException(404, "Candidate not found in this project")
-            if project["status"] in ("BUILDING", "READY_FOR_REVIEW") and candidate["is_selected"]:
+            if candidate["is_superseded"]:
+                raise HTTPException(409, "Ratkaisun lähdeaineisto on muuttunut. Päivitä analyysi ja valitse ajantasainen ehdotus.")
+            if project["status"] in ("BUILDING", "READY_FOR_REVIEW") and candidate["is_selected"] and project["delivery_mode"] == "AGENTS":
                 return ACCEPTED
-            if project["status"] != "CANDIDATES_READY":
-                raise HTTPException(409, "Build requires CANDIDATES_READY")
+            if project["status"] not in ("CANDIDATES_READY", "READY_FOR_REVIEW"):
+                raise HTTPException(409, "Valintaa voi muuttaa vain valmiiden ratkaisujen tai valmiin toimituksen vaiheessa.")
+            selected = await (await connection.execute(
+                "SELECT id FROM solution_candidates WHERE project_id=%s AND is_selected", (project_id,)
+            )).fetchone()
+            if selected and (
+                "expected_delivery_id" not in body.model_fields_set
+                or body.expected_delivery_id != project["active_delivery_id"]
+            ):
+                raise HTTPException(409, "Valinta on muuttunut tai vahvistus puuttuu. Päivitä työtila ja vahvista muutos uudelleen.")
             real_config()
             context = await context_for(connection, project)
             context["candidate"] = candidate
+            delivery_id = uuid4()
             await connection.execute(
                 "UPDATE solution_candidates SET is_selected = false WHERE project_id = %s", (project_id,)
             )
@@ -313,7 +337,8 @@ async def build(project_id: UUID, body: BuildRequest) -> dict:
                 "UPDATE solution_candidates SET is_selected = true WHERE id = %s", (body.candidate_id,)
             )
             await connection.execute(
-                "UPDATE projects SET status = 'BUILDING', delivery_mode = 'AGENTS' WHERE id = %s", (project_id,)
+                """UPDATE projects SET status = 'BUILDING', delivery_mode = 'AGENTS',
+                   active_delivery_id = %s WHERE id = %s""", (delivery_id, project_id)
             )
             await connection.execute(
                 """UPDATE solution_candidates SET implementation_status = 'IN_PROGRESS',
@@ -322,19 +347,20 @@ async def build(project_id: UUID, body: BuildRequest) -> dict:
             task_ids = {}
             for role in ROLES:
                 task = await (await connection.execute(
-                    """INSERT INTO agent_tasks (project_id, candidate_id, agent_role, output_log)
-                       VALUES (%s, %s, %s, %s) RETURNING id""",
+                    """INSERT INTO agent_tasks (project_id, candidate_id, agent_role, output_log, generation_mode, delivery_id)
+                       VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
                     (project_id, body.candidate_id, role,
                      "Waiting for the previous agent to finish." if project.get("language") == "en"
-                     else "Odottaa edellisen agentin valmistumista."),
+                     else "Odottaa edellisen agentin valmistumista.", "mock" if settings.mock_ai else "ai", delivery_id),
                 )).fetchone()
                 task_ids[role] = task["id"]
-    enqueue(build_job(project_id, context, task_ids))
+    enqueue(build_job(project_id, context, task_ids, delivery_id))
     return ACCEPTED
 
 
-async def build_job(project_id: UUID, context: dict, task_ids: dict) -> None:
+async def build_job(project_id: UUID, context: dict, task_ids: dict, delivery_id: UUID) -> None:
     active_role = ROLES[0]
+    root = settings.media_dir / str(project_id) / "artifacts" / "delivery" / str(delivery_id)
 
     async def started(role: str) -> None:
         nonlocal active_role
@@ -353,13 +379,12 @@ async def build_job(project_id: UUID, context: dict, task_ids: dict) -> None:
                 """UPDATE agent_tasks SET status = 'completed', output_log = output_log || %s,
                    artifacts_path = %s WHERE id = %s""",
                 ("\n" + output.summary + "\n" + "\n".join(paths),
-                 str(settings.media_dir / str(project_id) / "artifacts" / role), task_ids[role]),
+                 str(root / role), task_ids[role]),
             )
         logger.info("Build project=%s role=%s completed", project_id, role)
 
     try:
         async with asyncio.timeout(settings.job_timeout_seconds):
-            root = settings.media_dir / str(project_id) / "artifacts"
             root.mkdir(parents=True, exist_ok=True)
             if not root.resolve().is_relative_to(settings.media_dir.resolve()):
                 raise ValueError("Artifact sandbox escapes MEDIA_DIR")
@@ -367,7 +392,7 @@ async def build_job(project_id: UUID, context: dict, task_ids: dict) -> None:
             async with pool.connection() as connection:
                 async with connection.transaction():
                     project = await locked_project(connection, project_id)
-                    if project["status"] != "BUILDING":
+                    if project["status"] != "BUILDING" or project["active_delivery_id"] != delivery_id:
                         raise ValueError("Project state changed during build")
                     await connection.execute(
                         "UPDATE projects SET status = 'READY_FOR_REVIEW' WHERE id = %s", (project_id,)

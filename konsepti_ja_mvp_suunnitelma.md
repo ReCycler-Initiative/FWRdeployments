@@ -38,9 +38,8 @@ Upload MP4 recordings or VTT/TXT transcripts manually. Preserve each workshop's
 agenda, transcript and results. Later workshops build on earlier findings.
 
 The original research direction proposed speaker-baseline audio (`wav2vec2`) and
-microexpression (`MediaPipe`) fusion, with an indicative unvalidated processing
-estimate of EUR 0.30–0.75/hour. The MVP does not implement these local models or
-validate that estimate: it offers an external signal-service adapter. Interpretations
+microexpression (`MediaPipe`) fusion. The MVP does not implement these local
+models: it offers an external signal-service adapter. Interpretations
 must remain tentative, disclose limitations and never claim to prove emotions.
 
 ### Stage 2 — Problem definition and solution candidates
@@ -49,21 +48,35 @@ Synthesize context, transcripts and available signals into a timestamped
 pain-point map with quotes and a Mermaid current-state process diagram. The vision
 allows 2–4 alternatives; the current implementation produces three.
 
-Candidates contain benefits, risks, indicative costs, architecture and a technical,
+Candidates contain benefits, risks, architecture and a technical,
 process or hybrid classification. Review them on a live canvas alongside prompt
 drafts and static sandboxed prototype artifacts.
+Prices are not generated. Every generated output records mock/AI provenance;
+unknown historical provenance is explicitly unverified. Mock analysis and
+candidates are fixed examples, not findings extracted from the uploaded evidence.
+VTT/TXT content analysis needs an OpenAI API configuration, not video. Audio/face
+measurement requires video and the separately configured signal service.
 
 ### Stage 3 — Human approval and appropriate delivery
 
 Choose a candidate and delivery mode:
 
-- `PROMPTS`: refined Copilot and Claude Markdown prompts (default).
+- `PROMPTS`: one portable implementation prompt for Copilot, Claude or another tool (default).
 - `PLAN`: a standalone implementation plan with decision gates.
 - `AGENTS`: an explicit LangGraph architect → coder → data → QA chain.
 
 Local mock refinement needs no provider key. Real integrations require explicit
 configuration. Track the selected solution's progress manually even when coding
 occurs in an external tool. A ready prompt is not a completed implementation.
+After delivery, alternatives remain reviewable and the approved choice/outcome
+can be replaced with explicit confirmation. Keep previous files and per-candidate
+tracking; show only the current run in the Kanban. Replacements are blocked during
+`BUILDING` and rejected when based on a stale decision.
+Each workshop can store, replace, preview or remove a VTT/TXT transcript separately
+from its agenda and video. Saving is local; analysis is an explicit action.
+Corrections invalidate prior analysis and supersede proposals, without deleting
+earlier decisions or deliveries. Future ChatGPT-assisted solution improvement
+before prompt export remains a roadmap feature, not current template refinement.
 
 ## 3. Data and state — PostgreSQL 16 + pgvector
 
@@ -88,7 +101,8 @@ Core tables:
 - `sessions`: project FK, workshop title/focus/time/link/agenda, recording path,
   VTT transcript, pain points (JSONB), Mermaid diagram and lifecycle timestamps.
 - `solution_candidates`: project FK, title, summary, benefits/risks (JSONB),
-  cost, architecture, selection, solution type and manual implementation tracking.
+  architecture, provenance, selection, solution type and manual implementation tracking
+  (the nullable legacy cost column is retained only for data compatibility).
 - `agent_tasks`: project/candidate FKs, role (`architect`, `coder`, `data`, `qa`),
   status (`pending`, `running`, `completed`, `failed`), output log, artifact path
   and update timestamp.

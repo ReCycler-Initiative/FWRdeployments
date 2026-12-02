@@ -9,6 +9,7 @@ import { postJson, requestJson } from "@/lib/client-api";
 import type { Workspace } from "@/lib/types";
 import { Artifacts } from "./artifacts";
 import { implementationLabels, solutionTypeLabels } from "./implementation-tracker";
+import { GenerationNotice } from "./ai-notice";
 
 export function SolutionCanvas({ workspace, refinement, onRefinementChange }: {
   workspace: Workspace; refinement: string; onRefinementChange: (value: string) => void;
@@ -16,7 +17,7 @@ export function SolutionCanvas({ workspace, refinement, onRefinementChange }: {
   const { t } = useI18n();
 
   const [candidateId, setCandidateId] = useState<string | null>(null);
-  const [target, setTarget] = useState<"copilot" | "claude" | "plan">("copilot");
+  const [target, setTarget] = useState<"prompt" | "plan">("prompt");
   const [draftRefinement, setDraftRefinement] = useState(refinement);
   const [promptResult, setPromptResult] = useState({ key: "", text: "" });
   const [error, setError] = useState<string | null>(null);
@@ -48,7 +49,7 @@ export function SolutionCanvas({ workspace, refinement, onRefinementChange }: {
   function download() {
     const url = URL.createObjectURL(new Blob([prompt], { type: "text/plain;charset=utf-8" }));
     const link = document.createElement("a");
-    link.href = url; link.download = target === "plan" ? "frw-implementation-plan.md" : `frw-${target}-implementation-prompt.md`;
+    link.href = url; link.download = target === "plan" ? "frw-implementation-plan.md" : "frw-implementation-prompt.md";
     link.click(); URL.revokeObjectURL(url);
   }
 
@@ -62,6 +63,9 @@ export function SolutionCanvas({ workspace, refinement, onRefinementChange }: {
     <label className="mt-5">{t("Katselmoitava kandidaatti")}<select value={candidate.id} onChange={(event) => { setCandidateId(event.target.value); setNotice(null); }}>
       {workspace.candidates.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.title}{candidate.is_selected ? t(" · Hyväksytty") : ""}</option>)}
     </select></label>
+    <p className="field-hint">{t("Katseltavan vaihtoehdon vaihtaminen ei muuta hyväksyttyä valintaa. Hyväksy tai vaihda ratkaisu vertailukorteista.")}</p>
+    <GenerationNotice mode={candidate.generation_mode} />
+    {candidate.is_superseded && <p className="notice">{t("Lähdeaineisto on muuttunut. Tämä on aiempi ratkaisuehdotus; päivitä analyysi ennen uutta hyväksyntää.")}</p>}
     <div className="canvas-board mt-6">
       <article className="canvas-node"><p className="eyebrow">{t("Lähtötilanne")}</p><h3>{project.title}</h3>
         <p className="mt-3 text-sm leading-6 text-slate-500">{project.description}</p>
@@ -89,22 +93,22 @@ export function SolutionCanvas({ workspace, refinement, onRefinementChange }: {
     {view === "architecture" && <pre className="agenda mt-5">{candidate.architecture_spec}</pre>}
     {view === "prompt" && <div className="mt-5 space-y-4">
       <p className="notice">{t("Prompti kokoaa fasilitoinnin, työpajahistorian, lähteet ja ratkaisuspeksin. Tarkista salassapito ja työkalun käyttöoikeudet ennen promptin siirtämistä ulkoiseen AI-palveluun.")}</p>
-      <p className="field-hint">{t("MVP-mockhienosäätö: ei ChatGPT API -kutsuja eikä API-avaimen tarvetta. Mallipohja kokoaa fasilitoinnin tulokset ja omat tarkennuksesi.")}</p>
+      <p className="field-hint">{t("Paikallinen mallipohja – ei LLM-hienosäätöä tai API-kutsuja. Vienti toimii ilman API-avainta, mutta esimerkkikandidaatin vienti ei muuta sitä aineistopohjaiseksi ratkaisuksi.")}</p>
+      <p className="notice">{t("Yksi työkaluriippumaton toteutusprompti toimii Copilotissa, Claudessa tai muussa palvelussa. Ratkaisukokonaisuuden parantaminen ChatGPT API:lla ennen vientiä on jatkokehitystä, ei vielä käytössä. Pelkkä API-avaimen lisääminen ei aktivoi tätä tulevaa toimintoa.")}</p>
       <label>{t("Promptin tai suunnitelman tarkennukset")}<textarea rows={3} maxLength={5000} value={draftRefinement}
         placeholder={t("Esim. rajaa ensimmäinen pilotti ilman integraatioita; käytä nykyistä CRM:ää; keskity prosessimuutokseen.")}
         onChange={(event) => setDraftRefinement(event.target.value)} /></label>
-      <button className="button-secondary" onClick={() => { onRefinementChange(draftRefinement); setNotice(t("Mockhienosäätö on päivitetty. Tarkennukset liitetään myös hyväksynnässä tallennettavaan toimitukseen.")); }}>{t("Hienosäädä luonnos (mock)")}</button>
+      <button className="button-secondary" onClick={() => { onRefinementChange(draftRefinement); setNotice(t("Tarkennettu luonnos on koottu paikallisesti. Tarkennukset tallentuvat myös hyväksyttävään toimitukseen.")); }}>{t("Koosta tarkennettu luonnos")}</button>
       <div className="flex flex-wrap gap-2">
-        <button className={target === "copilot" ? "button-primary" : "button-secondary"} onClick={() => { setTarget("copilot"); setNotice(null); }}>GitHub Copilot</button>
-        <button className={target === "claude" ? "button-primary" : "button-secondary"} onClick={() => { setTarget("claude"); setNotice(null); }}>Claude</button>
+        <button className={target === "prompt" ? "button-primary" : "button-secondary"} onClick={() => { setTarget("prompt"); setNotice(null); }}>{t("Toteutusprompti")}</button>
         <button className={target === "plan" ? "button-primary" : "button-secondary"} onClick={() => { setTarget("plan"); setNotice(null); }}>{t("Toteutussuunnitelma")}</button>
         <button className="button-secondary" disabled={!prompt} onClick={() => void copy()}>{t("Kopioi prompti")}</button>
-        <button className="button-secondary" disabled={!prompt} onClick={download}>{t("Lataa prompti")}</button>
+        <button className="button-secondary" disabled={!prompt} onClick={download}>{target === "plan" ? t("Lataa suunnitelma") : t("Lataa prompti")}</button>
       </div>
       <label>{t("Toteutusprompti")}<textarea value={prompt} readOnly rows={16} aria-label={t("Toteutusprompti")} /></label>
     </div>}
     {view === "artifacts" && <div className="mt-5">{candidate.is_selected
-      ? <Artifacts id={project.id} files={workspace.artifacts} />
+      ? <Artifacts id={project.id} files={workspace.artifacts} activeDeliveryId={project.active_delivery_id} />
       : <p className="notice">{t("Tälle kandidaatille ei ole toteutusartefakteja. Hyväksy se ensin tai valitse jo hyväksytty ratkaisu.")}</p>}</div>}
     {error && <p className="error-message mt-4" role="alert">{error}</p>}
     {notice && <p className="notice mt-4" role="status">{notice}</p>}

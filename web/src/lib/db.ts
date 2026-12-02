@@ -2,7 +2,7 @@ import "server-only";
 import { Pool, type PoolClient } from "pg";
 import {
   agentTaskSchema, candidateSchema, contextDocumentSchema, projectSchema,
-  sessionSchema, type Workspace,
+  sessionSchema, type StoredWorkspace,
 } from "./types";
 
 const globalForDatabase = globalThis as typeof globalThis & {
@@ -58,7 +58,7 @@ export async function getProject(id: string) {
   return result.rows[0] ? projectSchema.parse(result.rows[0]) : null;
 }
 
-export async function getWorkspace(id: string): Promise<Omit<Workspace, "artifacts"> | null> {
+export async function getWorkspace(id: string): Promise<StoredWorkspace | null> {
   return transaction(async (client) => {
     await client.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
     const projectResult = await client.query("SELECT * FROM projects WHERE id = $1", [id]);
@@ -70,10 +70,15 @@ export async function getWorkspace(id: string): Promise<Omit<Workspace, "artifac
       "SELECT * FROM sessions WHERE project_id = $1 ORDER BY COALESCE(uploaded_at, created_at) DESC, id", [id],
     );
     const candidates = await client.query(
-      "SELECT * FROM solution_candidates WHERE project_id = $1 ORDER BY estimated_cost, id", [id],
+      `SELECT * FROM solution_candidates WHERE project_id = $1 AND (NOT is_superseded OR is_selected)
+       ORDER BY CASE solution_type WHEN 'PROCESS' THEN 0 WHEN 'TECHNICAL' THEN 1 ELSE 2 END, id`, [id],
     );
     const tasks = await client.query(
-      "SELECT * FROM agent_tasks WHERE project_id = $1 ORDER BY updated_at, id", [id],
+      `SELECT t.* FROM agent_tasks t JOIN projects p ON p.id=t.project_id
+       JOIN solution_candidates c ON c.id=t.candidate_id AND c.project_id=p.id
+       WHERE t.project_id=$1 AND c.is_selected
+         AND t.delivery_id IS NOT DISTINCT FROM p.active_delivery_id
+       ORDER BY t.updated_at, t.id`, [id],
     );
     return {
       project: projectSchema.parse(projectResult.rows[0]),

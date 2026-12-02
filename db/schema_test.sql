@@ -18,6 +18,13 @@ BEGIN
         VALUES (project, candidate, 'architect');
 
     BEGIN
+        UPDATE solution_candidates SET generation_mode = 'real' WHERE id = candidate;
+        RAISE EXCEPTION 'Invalid generation provenance accepted';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+
+    BEGIN
         UPDATE projects SET status = 'INVALID' WHERE id = project;
         RAISE EXCEPTION 'Invalid project status accepted';
     EXCEPTION WHEN check_violation THEN

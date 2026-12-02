@@ -9,6 +9,18 @@ export const projectStatuses = [
 ] as const;
 export const agentRoles = ["architect", "coder", "data", "qa"] as const;
 export const uuid = z.string().uuid();
+export const generationModeSchema = z.enum(["mock", "ai"]);
+export type GenerationMode = z.infer<typeof generationModeSchema>;
+export const workerCapabilitiesSchema = z.object({
+  mode: generationModeSchema,
+  openai_configured: z.boolean(),
+  video_signals_configured: z.boolean(),
+});
+export const aiCapabilitiesSchema = z.discriminatedUnion("status", [
+  workerCapabilitiesSchema.extend({ status: z.literal("available") }),
+  z.object({ status: z.literal("unavailable") }),
+]);
+export type AiCapabilities = z.infer<typeof aiCapabilitiesSchema>;
 const timestamp = z.union([z.date(), z.string()]).transform((value) =>
   value instanceof Date ? value.toISOString() : value,
 );
@@ -21,6 +33,8 @@ export const projectSchema = z.object({
   target_systems: z.array(z.string()),
   status: z.enum(projectStatuses),
   workshop_agenda: z.string().nullable(),
+  agenda_mode: generationModeSchema.nullable(),
+  active_delivery_id: uuid.nullable(),
   delivery_mode: z.enum(["PROMPTS", "PLAN", "AGENTS"]).nullable(),
   created_at: timestamp,
   updated_at: timestamp,
@@ -52,15 +66,19 @@ export const sessionSchema = z.object({
   project_id: uuid,
   video_path: z.string().nullable(),
   transcript_vtt: z.string().nullable(),
+  transcript_path: z.string().nullable(),
+  transcript_filename: z.string().nullable(),
   pain_points_json: z.union([
     z.array(painPointSchema),
     z.object({ error: z.string() }),
-    z.object({ status: z.literal("running") }),
+    z.object({ status: z.enum(["pending", "running"]) }),
   ]).nullable(),
   current_state_mermaid: z.string().nullable(),
   title: z.string(),
   created_at: timestamp,
   agenda: z.string().nullable(),
+  agenda_mode: generationModeSchema.nullable(),
+  analysis_mode: generationModeSchema.nullable(),
   notes: z.string(),
   scheduled_at: timestamp.nullable(),
   meeting_url: z.string().nullable(),
@@ -74,9 +92,10 @@ export const candidateSchema = z.object({
   summary: z.string().nullable(),
   benefits: z.array(z.string()),
   risks: z.array(z.string()),
-  estimated_cost: z.coerce.number().nonnegative().nullable(),
+  generation_mode: generationModeSchema.nullable(),
   architecture_spec: z.string().nullable(),
   is_selected: z.boolean(),
+  is_superseded: z.boolean(),
   solution_type: z.enum(["TECHNICAL", "PROCESS", "HYBRID"]),
   implementation_status: z.enum(["NOT_STARTED", "IN_PROGRESS", "BLOCKED", "IN_REVIEW", "COMPLETED"]),
   implementation_notes: z.string(),
@@ -90,7 +109,9 @@ export const agentTaskSchema = z.object({
   agent_role: z.enum(agentRoles),
   status: z.enum(["pending", "running", "completed", "failed"]),
   output_log: z.string().nullable(),
+  generation_mode: generationModeSchema.nullable(),
   artifacts_path: z.string().nullable(),
+  delivery_id: uuid.nullable(),
   updated_at: timestamp,
 });
 export const createProjectSchema = z.object({
@@ -117,6 +138,7 @@ export interface Artifact {
   size: number;
 }
 export interface Workspace {
+  ai: AiCapabilities;
   project: Project;
   documents: ContextDocument[];
   sessions: Session[];
@@ -124,8 +146,10 @@ export interface Workspace {
   tasks: AgentTask[];
   artifacts: Artifact[];
 }
+export type StoredWorkspace = Omit<Workspace, "artifacts" | "ai">;
 
 export const workspaceSchema = z.object({
+  ai: aiCapabilitiesSchema,
   project: projectSchema,
   documents: z.array(contextDocumentSchema),
   sessions: z.array(sessionSchema),

@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from uuid import uuid4
+from unittest.mock import AsyncMock, patch
 
 from app.agents.chain import ROLES, mock_output, run_chain
 from app.config import Settings
@@ -39,6 +40,22 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         result = await synthesize(self.settings, self.context, transcript, observations)
         self.assertEqual(len(result.candidates), 3)
         self.assertTrue(all("SIMULOITU" in point.quote for point in result.pain_points))
+        self.assertTrue(all("estimated_cost" not in candidate.model_dump() for candidate in result.candidates))
+
+    async def test_real_synthesis_passes_actual_transcript_and_requests_no_prices(self):
+        transcript = "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\nTilauksen hyväksyntä kestää viikon."
+        settings = self.settings.model_copy(update={"mock_ai": False})
+        observations = await signals(settings, uuid4(), {"video_path": "/media/workshop.vtt"}, transcript)
+        expected = await synthesize(self.settings, self.context, transcript, observations)
+        with patch("app.pipeline.synthesize.structured", new_callable=AsyncMock, return_value=expected) as provider:
+            result = await synthesize(settings, self.context, transcript, observations)
+        self.assertIs(result, expected)
+        provider.assert_awaited_once()
+        args = provider.call_args.args
+        self.assertIn("Do not generate prices", args[2])
+        self.assertEqual(args[3]["transcript_vtt"], transcript)
+        self.assertEqual(args[3]["documents"], self.context["documents"])
+        self.assertEqual(args[3]["signal_fusion"]["signals"], [])
 
     async def test_real_text_mode_has_no_invented_measured_signals(self):
         settings = self.settings.model_copy(update={"mock_ai": False})
@@ -68,6 +85,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         observations = await signals(self.settings, uuid4(), {}, transcript, "en")
         result = await synthesize(self.settings, context, transcript, observations)
         self.assertEqual({candidate.solution_type for candidate in result.candidates}, {"PROCESS", "TECHNICAL", "HYBRID"})
+        self.assertTrue(all("estimated_cost" not in candidate.model_dump() for candidate in result.candidates))
         self.assertTrue(all("SIMULATED" in point.quote for point in result.pain_points))
         self.assertIn("Manual entry", result.current_state_mermaid)
         for role in ROLES:

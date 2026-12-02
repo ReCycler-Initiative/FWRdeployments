@@ -80,26 +80,41 @@ Static HTML review is sandboxed and cannot run scripts or make network requests.
 | `POST /api/projects` | `{title, description, target_systems: string[], language?: "fi" \| "en"}` |
 | `GET /api/projects` | All projects |
 | `GET /api/projects/{id}` | Complete project workspace |
+| `DELETE /api/projects/{id}` | `{confirmed: true}`; permanently delete the project, dependent rows and its media; 409 during active analysis/agent tasks |
 | `POST /api/projects/{id}/context` | `{filename, content_text}` |
 | `POST /api/projects/{id}/context/file` | Multipart `file` |
 | `POST /api/projects/{id}/context/github` | `{url, ref?, token?}`; ephemeral read-only token |
 | `POST /api/projects/{id}/workshops` | `{title, notes?, scheduled_at?, meeting_url?}` |
+| `POST /api/projects/{id}/workshops/{sessionId}/transcript` | Multipart VTT/TXT `file`; save/replace without AI calls |
+| `DELETE /api/projects/{id}/workshops/{sessionId}/transcript` | Remove transcript, retain workshop/video/deliveries; invalidate old analysis |
 | `POST /api/projects/{id}/agenda` | Optional `{session_id}`; project or individual agenda |
-| `POST /api/projects/{id}/sessions` | Multipart `file`, `title`, optional `session_id` |
+| `POST /api/projects/{id}/sessions` | Multipart `file`, `title`, optional `session_id`, optional `analyze` (`true` by default; UI sends `false` to save only). An MP4 can be added to a transcript-only workshop; existing video is never overwritten. Use the workshop transcript route to replace existing VTT/TXT. |
 | `POST /api/projects/{id}/analyze` | `{session_id}`; retry analysis |
-| `POST /api/projects/{id}/build` | `{candidate_id}`; explicitly request agents |
-| `POST /api/projects/{id}/approve` | `{candidate_id, delivery_mode: "PROMPTS" \| "PLAN", refinement?}` |
+| `POST /api/projects/{id}/build` | `{candidate_id, expected_delivery_id?}`; explicitly request agents |
+| `POST /api/projects/{id}/approve` | `{candidate_id, delivery_mode: "PROMPTS" \| "PLAN", refinement?, expected_delivery_id?}` |
 | `PATCH /api/projects/{id}/implementation` | `{candidate_id, implementation_status, implementation_notes, implementation_url}` |
-| `POST /api/projects/{id}/prompts` | `{candidate_id, target: "copilot" \| "claude" \| "plan", refinement?}` |
-| `GET /api/projects/{id}/prompts?candidate_id=...&target=copilot` | Export a prompt draft; also supports `claude` and `plan` |
+| `POST /api/projects/{id}/prompts` | `{candidate_id, target?: "prompt" \| "plan", refinement?}` |
+| `GET /api/projects/{id}/prompts?candidate_id=...&target=prompt` | Export the shared implementation prompt; also supports `plan` |
 | `GET /api/projects/{id}/artifacts?path=...` | Text preview; append `&download=1` to download |
 
 Prompt refinement is local mock templating, not paid LLM optimization.
+Legacy `copilot`/`claude` target aliases return the same tool-neutral prompt.
+Prompt delivery now writes one `implementation-prompt.md`, not duplicate exports.
+Future ChatGPT-assisted solution refinement is not activated by adding an API key.
+Transcript saves use `pain_points_json: {status: "pending"}`; an explicit analyze
+request transitions to `running`. Corrections clear the affected analysis and
+supersede candidates without deleting previous candidate/agent records.
+Explicit analysis can also update a previously analyzed workshop, except during
+an active analysis or `BUILDING`. Unprocessed saved transcripts from other workshops
+are included as source context. Outdated selected candidates remain visible but
+cannot be reapproved; regenerate and confirm a current candidate instead.
 External implementation status is manual, not automatic GitHub synchronization.
 
 ### Worker
 
 - `GET /health`
+- `GET /capabilities` — current mode and provider/signal-service configuration
+  booleans only; no secrets and no claim that real calls have succeeded
 - `POST /api/projects/{id}/generate-agenda` with optional `{session_id}`
 - `POST /api/projects/{id}/extract-context` with `{path}`
 - `POST /api/projects/{id}/analyze` with `{session_id}`
@@ -107,6 +122,16 @@ External implementation status is manual, not automatic GitHub synchronization.
 
 The web calls the worker server-side. State transitions and project ownership
 are checked against the database, not trusted from UI state.
+Workspace responses include safe runtime AI status separately from persisted
+output provenance (`mock`, `ai`, or null for unknown). Enabling OpenAI does not
+reclassify historical demos. VTT/TXT content analysis does not require video.
+Generated candidates and new exports contain no price estimates. Legacy stored
+costs and previously accepted immutable exports are not rewritten.
+Changing an approved candidate or outcome requires `expected_delivery_id` matching
+the current workspace value (explicit `null` for legacy deliveries). Replacements
+are accepted in `READY_FOR_REVIEW` or `CANDIDATES_READY` after reanalysis, not
+`BUILDING`. Each replacement gets a new `active_delivery_id`; agent tasks
+carry the same `delivery_id`. Earlier files/logs are retained, not overwritten.
 
 ## Checks
 

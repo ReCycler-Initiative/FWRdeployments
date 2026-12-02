@@ -14,6 +14,7 @@ class AnalyzeRequest(StrictModel):
 
 class BuildRequest(StrictModel):
     candidate_id: UUID
+    expected_delivery_id: UUID | None = None
 
 
 class PainPoint(StrictModel):
@@ -30,7 +31,6 @@ class Candidate(StrictModel):
     summary: str = Field(min_length=1)
     benefits: list[str] = Field(min_length=1)
     risks: list[str] = Field(min_length=1)
-    estimated_cost: float = Field(ge=0, le=9999999999.99, allow_inf_nan=False)
     architecture_spec: str = Field(min_length=1)
 
 

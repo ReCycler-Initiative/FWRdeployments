@@ -15,28 +15,40 @@ export async function POST(request: Request, context: ProjectRoute) {
     const input = await jsonBody(request, z.object({
       candidate_id: uuid, delivery_mode: z.enum(["PROMPTS", "PLAN"]),
       refinement: z.string().trim().max(5000).default(""),
+      expected_delivery_id: uuid.nullable().optional(),
     }));
     const workspace = await getWorkspace(id);
     if (!workspace) throw new ApiError(404, "Projektia ei löytynyt.");
     const candidate = workspace.candidates.find((candidate) => candidate.id === input.candidate_id);
     if (!candidate) throw new ApiError(404, "Kandidaatti ei kuulu projektiin.");
-    const folder = path.join(projectMedia(id), "artifacts", "delivery", randomUUID());
+    const deliveryId = randomUUID();
+    const folder = path.join(projectMedia(id), "artifacts", "delivery", deliveryId);
     const written: string[] = [];
     try {
       await transaction(async (client) => {
-        const result = await client.query("SELECT status, delivery_mode FROM projects WHERE id=$1 FOR UPDATE", [id]);
+        const result = await client.query(
+          `SELECT status, delivery_mode, active_delivery_id,
+           (SELECT id FROM solution_candidates WHERE project_id=$1 AND is_selected) AS selected_candidate_id
+           FROM projects WHERE id=$1 FOR UPDATE`, [id],
+        );
         const current = result.rows[0];
         if (!current) throw new ApiError(404, "Projektia ei löytynyt.");
-        if (current.status === "READY_FOR_REVIEW" && current.delivery_mode === input.delivery_mode && candidate.is_selected) return;
-        if (current.status !== "CANDIDATES_READY") throw new ApiError(409, "Hyväksyntä vaatii valmiit ratkaisukandidaatit.");
-        const stillExists = await client.query("SELECT id FROM solution_candidates WHERE id=$1 AND project_id=$2", [candidate.id, id]);
+        if (current.status === "READY_FOR_REVIEW" && current.delivery_mode === input.delivery_mode
+          && current.selected_candidate_id === candidate.id) return;
+        if (!["CANDIDATES_READY", "READY_FOR_REVIEW"].includes(current.status)) {
+          throw new ApiError(409, "Valintaa voi muuttaa vain valmiiden ratkaisujen tai valmiin toimituksen vaiheessa.");
+        }
+        if (current.selected_candidate_id && (input.expected_delivery_id === undefined
+          || input.expected_delivery_id !== current.active_delivery_id)) {
+          throw new ApiError(409, "Valinta on muuttunut tai vahvistus puuttuu. Päivitä työtila ja vahvista muutos uudelleen.");
+        }
+        const stillExists = await client.query("SELECT id FROM solution_candidates WHERE id=$1 AND project_id=$2 AND NOT is_superseded", [candidate.id, id]);
         if (!stillExists.rows.length) throw new ApiError(409, "Kandidaatit ovat päivittyneet. Lataa työtila uudelleen.");
         const approved = { ...candidate, is_selected: true };
         const files = input.delivery_mode === "PLAN"
           ? [{ name: "implementation-plan.md", content: implementationPlan(workspace, approved, input.refinement) }]
           : [
-              { name: "copilot-prompt.md", content: implementationPrompt(workspace, approved, "copilot", input.refinement) },
-              { name: "claude-prompt.md", content: implementationPrompt(workspace, approved, "claude", input.refinement) },
+              { name: "implementation-prompt.md", content: implementationPrompt(workspace, approved, input.refinement) },
             ];
         await mkdir(folder, { recursive: true });
         for (const file of files) {
@@ -46,7 +58,10 @@ export async function POST(request: Request, context: ProjectRoute) {
         }
         await client.query("UPDATE solution_candidates SET is_selected=false WHERE project_id=$1", [id]);
         await client.query("UPDATE solution_candidates SET is_selected=true WHERE id=$1", [candidate.id]);
-        await client.query("UPDATE projects SET status='READY_FOR_REVIEW', delivery_mode=$2 WHERE id=$1", [id, input.delivery_mode]);
+        await client.query(
+          "UPDATE projects SET status='READY_FOR_REVIEW', delivery_mode=$2, active_delivery_id=$3 WHERE id=$1",
+          [id, input.delivery_mode, deliveryId],
+        );
       });
     } catch (error) {
       await Promise.all(written.map((filename) => unlink(filename)));

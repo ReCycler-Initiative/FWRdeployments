@@ -5,7 +5,7 @@ import type { ProjectStatus } from "@/lib/types";
 
 export const statusLabels: Record<ProjectStatus, string> = {
   PREPARATION: "Valmistelu",
-  WORKSHOP_UPLOADED: "Analysoidaan työpajaa",
+  WORKSHOP_UPLOADED: "Työpaja-aineisto lisätty",
   CANDIDATES_READY: "Ratkaisut arvioitavana",
   BUILDING: "Toteutus käynnissä",
   READY_FOR_REVIEW: "Valmis katselmointiin",

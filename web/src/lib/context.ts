@@ -21,7 +21,7 @@ export async function saveContext(id: string, input: {
       [id, input.filename, input.content_text, input.source_type,
         input.source_url ?? null, input.source_revision ?? null, input.storage_path ?? null],
     );
-    await client.query("UPDATE projects SET workshop_agenda = NULL WHERE id = $1", [id]);
+    await client.query("UPDATE projects SET workshop_agenda = NULL, agenda_mode = NULL WHERE id = $1", [id]);
     return contextDocumentSchema.parse(result.rows[0]);
   });
 }

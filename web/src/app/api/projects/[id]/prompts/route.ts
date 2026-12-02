@@ -6,7 +6,7 @@ import { implementationPlan, implementationPrompt } from "@/lib/prompts";
 
 const promptInput = z.object({
   candidate_id: uuid,
-  target: z.enum(["copilot", "claude", "plan"]).default("copilot"),
+  target: z.enum(["prompt", "copilot", "claude", "plan"]).default("prompt"),
   refinement: z.string().trim().max(5000).default(""),
 });
 
@@ -16,9 +16,9 @@ async function generate(id: string, input: z.infer<typeof promptInput>) {
   const candidate = workspace.candidates.find((candidate) => candidate.id === input.candidate_id);
   if (!candidate) throw new ApiError(404, "Kandidaatti ei kuulu projektiin.");
   return Response.json({
-    target: input.target, mock: true,
+    target: input.target === "plan" ? "plan" : "prompt", mock: true, method: "template",
     prompt: input.target === "plan" ? implementationPlan(workspace, candidate, input.refinement)
-      : implementationPrompt(workspace, candidate, input.target, input.refinement),
+      : implementationPrompt(workspace, candidate, input.refinement),
   }, { headers: { "Cache-Control": "no-store" } });
 }
 
@@ -27,7 +27,7 @@ export async function GET(request: Request, context: ProjectRoute) {
     const id = await projectId(context);
     const params = new URL(request.url).searchParams;
     return generate(id, promptInput.parse({
-      candidate_id: params.get("candidate_id"), target: params.get("target") ?? "copilot",
+      candidate_id: params.get("candidate_id"), target: params.get("target") ?? "prompt",
     }));
   });
 }

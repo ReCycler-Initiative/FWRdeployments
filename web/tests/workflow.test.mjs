@@ -1,8 +1,155 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Pool } from "pg";
-import { rm } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+
+test("project deletion requires confirmation, blocks active work and removes only the target project", { timeout: 30000 }, async () => {
+  const base = process.env.TEST_WEB_URL;
+  assert.ok(base && process.env.DATABASE_URL && process.env.MEDIA_DIR && process.env.WORKER_URL);
+  assert.equal((await (await fetch(`${process.env.WORKER_URL}/health`)).json()).mock_ai, true);
+  const db = new Pool({ connectionString: process.env.DATABASE_URL });
+  const projects = [];
+  const remove = (id, body = { confirmed: true }, headers = {}) => fetch(`${base}/api/projects/${id}`, {
+    method: "DELETE", headers: { "Content-Type": "application/json", Cookie: "frw_locale=en", ...headers },
+    body: JSON.stringify(body),
+  });
+  try {
+    for (const title of ["Deletion target confirmation test", "Deletion neighbor retained", "Empty project deletion"]) {
+      const response = await fetch(`${base}/api/projects`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, description: "Isolated deletion fixture", target_systems: [] }),
+      });
+      assert.equal(response.status, 201);
+      projects.push((await response.json()).id);
+    }
+    const [id, neighbor, empty] = projects;
+    const folder = path.join(process.env.MEDIA_DIR, id);
+    const neighborFile = path.join(process.env.MEDIA_DIR, neighbor, "retained.txt");
+    await mkdir(path.join(folder, "artifacts"), { recursive: true });
+    await mkdir(path.dirname(neighborFile), { recursive: true });
+    await writeFile(path.join(folder, "artifacts", "delivery.md"), "Delete this project artifact");
+    await writeFile(path.join(folder, "workshop.vtt"), "WEBVTT\n\nDelete this transcript");
+    await writeFile(neighborFile, "Keep the other project untouched");
+    await db.query("INSERT INTO context_documents(project_id,filename) VALUES($1,'context.txt')", [id]);
+    const session = (await db.query("INSERT INTO sessions(project_id,title) VALUES($1,'Workshop') RETURNING id", [id])).rows[0].id;
+    const candidate = (await db.query("INSERT INTO solution_candidates(project_id,title) VALUES($1,'Proposal') RETURNING id", [id])).rows[0].id;
+    const task = (await db.query(
+      "INSERT INTO agent_tasks(project_id,candidate_id,agent_role,status) VALUES($1,$2,'architect','completed') RETURNING id",
+      [id, candidate],
+    )).rows[0].id;
+    assert.equal((await remove(id, {}, { Origin: "https://other.invalid" })).status, 403);
+    const unconfirmed = await remove(id, {});
+    assert.equal(unconfirmed.status, 400);
+    assert.match((await unconfirmed.json()).error, /Project deletion must be confirmed/);
+    assert.equal((await remove(id, { confirmed: false })).status, 400);
+    assert.equal((await remove("not-a-uuid")).status, 400);
+    assert.equal((await remove("00000000-0000-4000-8000-000000000001")).status, 404);
+    await db.query("UPDATE sessions SET pain_points_json='{\"status\":\"running\"}' WHERE id=$1", [session]);
+    assert.equal((await remove(id)).status, 409);
+    await db.query("UPDATE sessions SET pain_points_json=NULL WHERE id=$1", [session]);
+    await db.query("UPDATE agent_tasks SET status='running' WHERE id=$1", [task]);
+    assert.equal((await remove(id)).status, 409);
+    assert.equal((await fetch(`${base}/api/projects/${id}`)).status, 200);
+    assert.match(await readFile(path.join(folder, "workshop.vtt"), "utf8"), /Delete this transcript/);
+    await db.query("UPDATE agent_tasks SET status='completed' WHERE id=$1", [task]);
+    await db.query("UPDATE projects SET status='BUILDING',delivery_mode='AGENTS' WHERE id=$1", [id]);
+    assert.equal((await remove(id)).status, 409, "Protect the gap between the last agent finishing and build finalization");
+    await db.query("UPDATE agent_tasks SET status='failed' WHERE id=$1", [task]);
+    const deleted = await remove(id);
+    assert.equal(deleted.status, 200, "Failed, inactive builds can be deleted");
+    assert.equal((await deleted.json()).deleted, true);
+    assert.equal((await fetch(`${base}/api/projects/${id}`)).status, 404);
+    const remaining = await db.query(
+      `SELECT (SELECT count(*) FROM projects WHERE id=$1)
+       + (SELECT count(*) FROM context_documents WHERE project_id=$1)
+       + (SELECT count(*) FROM sessions WHERE project_id=$1)
+       + (SELECT count(*) FROM solution_candidates WHERE project_id=$1)
+       + (SELECT count(*) FROM agent_tasks WHERE project_id=$1) AS count`, [id],
+    );
+    assert.equal(Number(remaining.rows[0].count), 0);
+    await assert.rejects(readFile(path.join(folder, "artifacts", "delivery.md")), { code: "ENOENT" });
+    await assert.rejects(readFile(path.join(folder, "workshop.vtt")), { code: "ENOENT" });
+    assert.equal(await readFile(neighborFile, "utf8"), "Keep the other project untouched");
+    assert.equal((await fetch(`${base}/api/projects/${neighbor}`)).status, 200);
+    const html = await (await fetch(base)).text();
+    assert.ok(!html.includes("Deletion target confirmation test"));
+    assert.ok(html.includes("Deletion neighbor retained"));
+    assert.equal((await remove(empty)).status, 200, "Projects without a media folder can be deleted");
+  } finally {
+    for (const id of projects) {
+      await db.query("DELETE FROM projects WHERE id=$1", [id]);
+      await rm(path.join(process.env.MEDIA_DIR, id), { recursive: true, force: true });
+    }
+    await db.end();
+  }
+});
+
+test("workshop material saves to the chosen workshop without analysis and preserves other evidence", { timeout: 30000 }, async () => {
+  const base = process.env.TEST_WEB_URL;
+  assert.ok(base && process.env.DATABASE_URL && process.env.MEDIA_DIR && process.env.WORKER_URL);
+  assert.equal((await (await fetch(`${process.env.WORKER_URL}/health`)).json()).mock_ai, true);
+  const db = new Pool({ connectionString: process.env.DATABASE_URL });
+  let id;
+  const json = (body) => ({
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  const material = (filename, content, sessionId) => {
+    const form = new FormData();
+    form.set("file", new File([content], filename));
+    form.set("title", "New workshop from evidence");
+    form.set("analyze", "false");
+    if (sessionId) form.set("session_id", sessionId);
+    return { method: "POST", body: form };
+  };
+  try {
+    const created = await fetch(`${base}/api/projects`, json({
+      title: "Workshop material routing test", description: "Save without calling AI", target_systems: [],
+    }));
+    assert.equal(created.status, 201);
+    id = (await created.json()).id;
+    const route = `${base}/api/projects/${id}`;
+    const first = await (await fetch(`${route}/workshops`, json({ title: "Workshop 1", notes: "Keep first notes" }))).json();
+    const second = await (await fetch(`${route}/workshops`, json({ title: "Workshop 2", notes: "Keep second notes" }))).json();
+    const saved = await fetch(`${route}/sessions`, material("first.txt", "First workshop source", first.id));
+    assert.equal(saved.status, 201);
+    assert.equal((await saved.json()).session_id, first.id);
+    assert.equal((await fetch(`${route}/workshops/${second.id}/transcript`, material("second.txt", "Second workshop source"))).status, 200);
+    await db.query("UPDATE projects SET status='READY_FOR_REVIEW' WHERE id=$1", [id]);
+    const video = Buffer.alloc(12);
+    video.write("ftyp", 4);
+    assert.equal((await fetch(`${route}/sessions`, material("recording.mp4", video, first.id))).status, 201,
+      "A held workshop can receive its video without losing its saved transcript");
+    const snapshot = await (await fetch(route)).json();
+    const workshop = snapshot.sessions.find((session) => session.id === first.id);
+    assert.equal(snapshot.sessions.length, 2);
+    assert.equal(workshop.title, "Workshop 1");
+    assert.equal(workshop.notes, "Keep first notes");
+    assert.equal(workshop.transcript_vtt, "First workshop source");
+    assert.equal(workshop.transcript_filename, "first.txt");
+    assert.ok(workshop.video_path.endsWith(".mp4"));
+    assert.equal(workshop.processed_at, null);
+    assert.equal(snapshot.candidates.length, 0);
+    const savedHtml = await (await fetch(`${base}/projects/${id}`, { headers: { Cookie: "frw_locale=en" } })).text();
+    assert.match(savedHtml, /Workshop material added/);
+    assert.doesNotMatch(savedHtml, />Analyzing workshop</);
+    const neighbor = snapshot.sessions.find((session) => session.id === second.id);
+    assert.equal(neighbor.transcript_vtt, "Second workshop source");
+    assert.equal(neighbor.notes, "Keep second notes");
+    assert.equal((await fetch(`${route}/sessions`, material("other.mp4", video, first.id))).status, 409);
+    assert.equal((await fetch(`${route}/sessions`, material("third.txt", "Third workshop source"))).status, 201);
+    const after = await (await fetch(route)).json();
+    assert.equal(after.sessions.length, 3);
+    assert.equal(after.candidates.length, 0);
+    assert.ok(after.sessions.every((session) => session.processed_at === null));
+  } finally {
+    if (id) {
+      await db.query("DELETE FROM projects WHERE id=$1", [id]);
+      await rm(path.join(process.env.MEDIA_DIR, id), { recursive: true, force: true });
+    }
+    await db.end();
+  }
+});
 
 test("language preference, project content language and English exports remain independent", { timeout: 60000 }, async () => {
   const base = process.env.TEST_WEB_URL;
@@ -73,14 +220,32 @@ test("language preference, project content language and English exports remain i
     }
     assert.equal(workspace.project.status, "CANDIDATES_READY");
     assert.match(workspace.candidates[0].title, /simulated option/);
+    assert.equal(workspace.ai.status, "available");
+    assert.equal(workspace.ai.mode, "mock");
+    assert.equal(workspace.sessions[0].agenda_mode, "mock");
+    assert.equal(workspace.sessions[0].analysis_mode, "mock");
+    assert.ok(workspace.candidates.every((candidate) => candidate.generation_mode === "mock" && !("estimated_cost" in candidate)));
+    const workspaceHtml = await (await fetch(`${base}/projects/${id}`, { headers: { Cookie: "frw_locale=en" } })).text();
+    assert.match(workspaceHtml, /Choose an outcome/);
+    assert.match(workspaceHtml, /Demo mode/);
+    assert.match(workspaceHtml, /not evidence-based AI output/);
+    assert.doesNotMatch(workspaceHtml, /What outcome is enough for the customer|candidate-price/);
     assert.equal(workspace.documents[0].content_text, "Alkuperäinen lähde säilyy.");
     assert.match(workspace.sessions[0].transcript_vtt, /Original English workshop transcript/);
-    for (const target of ["copilot", "claude", "plan"]) {
+    let portablePrompt;
+    for (const target of ["prompt", "copilot", "claude", "plan"]) {
       const draft = await post(`/api/projects/${id}/prompts`, {
         candidate_id: workspace.candidates[0].id, target, refinement: "Keep the pilot small.",
       }, "frw_locale=fi");
       assert.match(draft.data.prompt, target === "plan" ? /# Implementation plan:/ : /Forward Deployment implementation prompt/);
       assert.match(draft.data.prompt, /Keep the pilot small/);
+      assert.match(draft.data.prompt, /Candidate: SIMULATED EXAMPLE/);
+      assert.match(draft.data.prompt, /Pilot review: SIMULATED EXAMPLE/);
+      assert.doesNotMatch(draft.data.prompt, /Indicative budget|\bEUR\b|estimated_cost/);
+      if (target !== "plan") {
+        if (portablePrompt) assert.equal(draft.data.prompt, portablePrompt, "Copilot/Claude aliases must return the same portable prompt");
+        portablePrompt = draft.data.prompt;
+      }
       if (target !== "plan") assert.match(draft.data.prompt, /Alkuperäinen lähde säilyy/);
     }
     await post(`/api/projects/${id}/approve`, { candidate_id: workspace.candidates[0].id, delivery_mode: "PROMPTS" });
@@ -92,6 +257,21 @@ test("language preference, project content language and English exports remain i
       assert.match(preview.content, /The customer has selected this candidate/);
       assert.doesNotMatch(preview.content, /NOT APPROVED/);
     }
+    const firstDelivery = workspace.project.active_delivery_id;
+    const originalFiles = workspace.artifacts.map((artifact) => artifact.path);
+    const alternative = workspace.candidates.find((candidate) => !candidate.is_selected);
+    await post(`/api/projects/${id}/approve`, {
+      candidate_id: alternative.id, delivery_mode: "PLAN", expected_delivery_id: firstDelivery,
+    });
+    const replaced = await (await fetch(`${base}/api/projects/${id}`)).json();
+    assert.notEqual(replaced.project.active_delivery_id, firstDelivery);
+    assert.equal(replaced.candidates.find((candidate) => candidate.is_selected).id, alternative.id);
+    assert.equal(replaced.candidates.filter((candidate) => candidate.is_selected).length, 1);
+    assert.ok(originalFiles.every((file) => replaced.artifacts.some((artifact) => artifact.path === file)));
+    assert.equal(replaced.artifacts.length, originalFiles.length + 1);
+    const replacedHtml = await (await fetch(`${base}/projects/${id}`, { headers: { Cookie: "frw_locale=en" } })).text();
+    assert.match(replacedHtml, /Compare alternatives or change selection/);
+    assert.match(replacedHtml, /Previous deliveries/);
   } finally {
     for (const id of projects) {
       await db.query("DELETE FROM projects WHERE id=$1", [id]);
@@ -109,6 +289,10 @@ test("mock workspace: preparation, upload, analysis, selection and four-agent de
   assert.ok(process.env.WORKER_URL);
   const workerHealth = await fetch(`${process.env.WORKER_URL}/health`);
   assert.equal((await workerHealth.json()).mock_ai, true, "This test must never call real AI providers");
+  const capabilities = await (await fetch(`${process.env.WORKER_URL}/capabilities`)).json();
+  assert.deepEqual(Object.keys(capabilities).sort(), ["mode", "openai_configured", "video_signals_configured"]);
+  assert.equal(capabilities.mode, "mock");
+  assert.equal(typeof capabilities.openai_configured, "boolean");
   const db = new Pool({ connectionString: process.env.DATABASE_URL });
   const projects = [];
   async function call(url, options = {}) {
@@ -150,6 +334,14 @@ test("mock workspace: preparation, upload, analysis, selection and four-agent de
         assert.equal(draft.status, 200);
         assert.equal(draft.data.mock, true);
         assert.match(draft.data.prompt, /Pilotti ilman integraatioita/);
+        assert.match(draft.data.prompt, /Kandidaatti: Alkuperää ei tallennettu/);
+        assert.doesNotMatch(draft.data.prompt, /1000|EUR|kustannusarvio|Alustava budjetti/);
+        if (delivery_mode === "PLAN") {
+          await db.query("UPDATE solution_candidates SET generation_mode='ai' WHERE id=$1", [candidate_id]);
+          const recordedAi = await post(`/api/projects/${id}/prompts`, { candidate_id, target: "plan" });
+          assert.match(recordedAi.data.prompt, /Kandidaatti: AI-generoitu luonnos/,
+            "Recorded output provenance must not be relabeled by current mock configuration");
+        }
         const approved = await post(`/api/projects/${id}/approve`, { candidate_id, delivery_mode, refinement });
         assert.equal(approved.status, 200);
         const workspace = await (await fetch(`${base}/api/projects/${id}`)).json();
@@ -158,9 +350,10 @@ test("mock workspace: preparation, upload, analysis, selection and four-agent de
         assert.equal(workspace.tasks.length, 0, "Non-agent deliveries must never create agent tasks");
         assert.equal(workspace.candidates[0].implementation_status, "NOT_STARTED",
           "Exported prompts are not a completed implementation");
-        assert.equal(workspace.artifacts.length, delivery_mode === "PROMPTS" ? 2 : 1);
+        assert.equal(workspace.artifacts.length, 1, "A shared prompt must not be duplicated per tool");
         const preview = await (await fetch(`${base}/api/projects/${id}/artifacts?path=${encodeURIComponent(workspace.artifacts[0].path)}`)).json();
         assert.match(preview.content, /Pilotti ilman integraatioita/);
+        assert.doesNotMatch(preview.content, /1000|EUR|kustannusarvio|Alustava budjetti/);
         if (delivery_mode === "PROMPTS") assert.doesNotMatch(preview.content, /EI HYVÄKSYTTY/);
         assert.equal((await post(`/api/projects/${id}/approve`, { candidate_id, delivery_mode, refinement })).status, 200);
         const repeated = await (await fetch(`${base}/api/projects/${id}`)).json();
@@ -180,6 +373,16 @@ test("mock workspace: preparation, upload, analysis, selection and four-agent de
         assert.equal(tracked.tasks.length, 0);
         assert.match(tracked.candidates[0].implementation_notes, /GH Copilotissa/);
         assert.equal(tracked.candidates[0].implementation_url, "https://github.com/example/project/pull/42");
+        if (delivery_mode === "PROMPTS") {
+          const agents = await post(`/api/projects/${id}/build`, {
+            candidate_id, expected_delivery_id: tracked.project.active_delivery_id,
+          });
+          assert.equal(agents.status, 202);
+          const built = await waitFor(id, (value) => value.project.status === "READY_FOR_REVIEW");
+          assert.equal(built.project.delivery_mode, "AGENTS", "The same candidate can move from prompt export to agents");
+          assert.equal(built.tasks.length, 4, "Switching a prompt delivery to agents must actually start the chain");
+          assert.match(built.candidates[0].implementation_notes, /GH Copilotissa/);
+        }
       }
     } finally {
       for (const id of projects) {
@@ -230,6 +433,7 @@ test("mock workspace: preparation, upload, analysis, selection and four-agent de
     let snapshot = (await call(route)).data;
     assert.equal(snapshot.documents.length, 1);
     assert.equal(snapshot.project.workshop_agenda, agenda.data.agenda);
+    assert.equal(snapshot.project.agenda_mode, "mock");
     const contextFile = new FormData();
     contextFile.set("file", new File(["# Prosessi\nPalautteet kopioidaan Exceliin."], "process.md"));
     const imported = await call(`${route}/context/file`, { method: "POST", body: contextFile });
@@ -270,6 +474,8 @@ test("mock workspace: preparation, upload, analysis, selection and four-agent de
     assert.equal(snapshot.sessions[0].agenda, firstAgenda.data.agenda);
     assert.ok(snapshot.sessions[0].video_path.startsWith(path.join(process.env.MEDIA_DIR, id)));
     assert.ok(Array.isArray(snapshot.sessions[0].pain_points_json));
+    assert.equal(snapshot.sessions[0].agenda_mode, "mock");
+    assert.equal(snapshot.sessions[0].analysis_mode, "mock");
     assert.ok(snapshot.sessions[0].pain_points_json.length > 0);
     for (const point of snapshot.sessions[0].pain_points_json) {
       assert.ok(point.timestamp_seconds >= 0);
@@ -281,9 +487,16 @@ test("mock workspace: preparation, upload, analysis, selection and four-agent de
     for (const candidate of snapshot.candidates) {
       assert.ok(candidate.benefits.length);
       assert.ok(candidate.risks.length);
-      assert.ok(candidate.estimated_cost > 0);
+      assert.equal(candidate.generation_mode, "mock");
+      assert.ok(!("estimated_cost" in candidate));
       assert.ok(candidate.architecture_spec);
     }
+    const storedCosts = await db.query("SELECT estimated_cost FROM solution_candidates WHERE project_id=$1", [id]);
+    assert.ok(storedCosts.rows.every((row) => row.estimated_cost === null), "New candidates must not store generated prices");
+    const workspaceHtml = await (await fetch(`${base}/projects/${id}`)).text();
+    assert.match(workspaceHtml, /Valitse lopputulos/);
+    assert.match(workspaceHtml, /Esimerkkisisältö/);
+    assert.doesNotMatch(workspaceHtml, /Mikä lopputulos riittää asiakkaalle|candidate-price/);
     const firstSessionId = snapshot.sessions[0].id;
     const plannedSecond = await call(`${route}/workshops`, post({
       title: "Työpaja 2: validointi", notes: "Varmennetaan pilotin hyväksymiskriteerit.",
@@ -311,6 +524,8 @@ test("mock workspace: preparation, upload, analysis, selection and four-agent de
       assert.match(prompt.data.prompt, /EI HYVÄKSYTTY/);
       assert.match(prompt.data.prompt, /Prosessi/);
       assert.doesNotMatch(prompt.data.prompt, /not-a-real-token/);
+      assert.match(prompt.data.prompt, /Kandidaatti: SIMULOITU ESIMERKKI/);
+      assert.doesNotMatch(prompt.data.prompt, /Alustava kustannusarvio|Alustava budjetti|\bEUR\b/);
     }
     const other = await call("/api/projects", post({ title: "Toinen projekti", description: "Viiteavaintesti", target_systems: [] }));
     projects.push(other.data.id);
@@ -324,12 +539,21 @@ test("mock workspace: preparation, upload, analysis, selection and four-agent de
     assert.equal(started.candidates.filter((candidate) => candidate.is_selected).length, 1);
     assert.equal(started.tasks.length, 4);
     assert.ok(started.tasks.some((task) => task.status === "pending" || task.status === "running"));
+    assert.equal((await call(`${route}/workshops/${firstSessionId}/transcript`, { method: "DELETE" })).status, 409);
+    assert.equal((await call(`${route}/approve`, post({
+      candidate_id: snapshot.candidates[1].id, delivery_mode: "PLAN",
+      expected_delivery_id: started.project.active_delivery_id,
+    }))).status, 409, "Selection changes must be blocked while agents are building");
+    assert.equal((await call(`${route}/build`, post({
+      candidate_id: snapshot.candidates[1].id, expected_delivery_id: started.project.active_delivery_id,
+    }))).status, 409);
     const duplicate = await call(`${route}/build`, post({ candidate_id: chosen }));
     assert.ok([202, 409].includes(duplicate.status));
     snapshot = await waitFor(id, (value) => value.project.status === "READY_FOR_REVIEW");
     assert.equal(snapshot.tasks.length, 4, "Duplicate requests must not create duplicate tasks");
     assert.deepEqual(snapshot.tasks.map((task) => task.agent_role).sort(), ["architect", "coder", "data", "qa"]);
     assert.ok(snapshot.tasks.every((task) => task.status === "completed" && task.output_log && task.artifacts_path));
+    assert.ok(snapshot.tasks.every((task) => task.generation_mode === "mock"));
     assert.equal(snapshot.project.delivery_mode, "AGENTS");
     assert.equal(snapshot.candidates.find((candidate) => candidate.is_selected).implementation_status, "IN_REVIEW");
     assert.ok(snapshot.artifacts.length >= 4);
@@ -344,10 +568,183 @@ test("mock workspace: preparation, upload, analysis, selection and four-agent de
     assert.equal(await download.text(), preview.data.content);
     assert.equal((await call(`${route}/artifacts?path=${encodeURIComponent("../outside.txt")}`)).status, 400);
     assert.equal((await call(`${route}/context`, post({ filename: "Late", content_text: "Not allowed" }))).status, 409);
+    const firstDelivery = snapshot.project.active_delivery_id;
+    const alternative = snapshot.candidates.find((candidate) => candidate.id !== chosen).id;
+    assert.equal((await call(`${route}/build`, post({ candidate_id: alternative }))).status, 409,
+      "Replacing an approval requires the expected current delivery");
+    assert.equal((await call(`${route}/build`, post({
+      candidate_id: alternative, expected_delivery_id: firstDelivery,
+    }))).status, 202);
+    snapshot = await waitFor(id, (value) => value.project.status === "READY_FOR_REVIEW");
+    const secondDelivery = snapshot.project.active_delivery_id;
+    assert.notEqual(secondDelivery, firstDelivery);
+    assert.equal(snapshot.tasks.length, 4, "Only the active run belongs in the Kanban");
+    assert.ok(snapshot.tasks.every((task) => task.candidate_id === alternative && task.delivery_id === secondDelivery));
+    assert.equal(Number((await db.query("SELECT count(*) FROM agent_tasks WHERE project_id=$1", [id])).rows[0].count), 8,
+      "Previous agent logs must remain stored");
+    assert.equal((await call(`${route}/artifacts?path=${encodeURIComponent(file.path)}`)).data.content, preview.data.content,
+      "Starting another run must never overwrite earlier artifacts");
+    assert.equal((await call(`${route}/approve`, post({ candidate_id: chosen, delivery_mode: "PLAN" }))).status, 409);
+    assert.equal((await call(`${route}/approve`, post({
+      candidate_id: chosen, delivery_mode: "PLAN", expected_delivery_id: firstDelivery,
+    }))).status, 409, "A stale browser must not replace the current decision");
+    assert.equal((await call(`${route}/approve`, post({
+      candidate_id: alternative, delivery_mode: "PLAN", expected_delivery_id: secondDelivery,
+    }))).status, 200, "The outcome can change without changing the candidate");
+    snapshot = (await call(route)).data;
+    assert.equal(snapshot.tasks.length, 0, "Previous agents must not appear as the current plan's agents");
+    assert.equal(snapshot.candidates.find((candidate) => candidate.id === chosen).implementation_status, "IN_REVIEW");
+    assert.equal(snapshot.artifacts.filter((artifact) =>
+      artifact.path.startsWith(`delivery/${snapshot.project.active_delivery_id}/`)).length, 1);
+    assert.equal((await call(`${route}/approve`, post({
+      candidate_id: alternative, delivery_mode: "PROMPTS", expected_delivery_id: snapshot.project.active_delivery_id,
+    }))).status, 200);
+    snapshot = (await call(route)).data;
+    assert.equal(snapshot.tasks.length, 0);
+    assert.equal((await call(`${route}/build`, post({
+      candidate_id: chosen, expected_delivery_id: snapshot.project.active_delivery_id,
+    }))).status, 202, "A previously selected candidate can be selected again");
+    snapshot = await waitFor(id, (value) => value.project.status === "READY_FOR_REVIEW");
+    assert.equal(snapshot.tasks.length, 4);
+    assert.ok(snapshot.tasks.every((task) => task.candidate_id === chosen && task.delivery_id === snapshot.project.active_delivery_id));
+    assert.equal(Number((await db.query("SELECT count(*) FROM agent_tasks WHERE project_id=$1", [id])).rows[0].count), 12);
+    assert.equal((await call(`${route}/artifacts?path=${encodeURIComponent(file.path)}`)).data.content, preview.data.content);
   } finally {
     for (const id of projects) {
       await db.query("DELETE FROM projects WHERE id = $1", [id]);
       assert.match(id, /^[0-9a-f-]{36}$/);
+      await rm(path.join(process.env.MEDIA_DIR, id), { recursive: true, force: true });
+    }
+    await db.end();
+  }
+});
+
+test("workshop transcripts can be saved, corrected and removed without losing workshops or previous deliveries", { timeout: 60000 }, async () => {
+  const base = process.env.TEST_WEB_URL;
+  assert.ok(base && process.env.DATABASE_URL && process.env.MEDIA_DIR && process.env.WORKER_URL);
+  assert.equal((await (await fetch(`${process.env.WORKER_URL}/health`)).json()).mock_ai, true);
+  const db = new Pool({ connectionString: process.env.DATABASE_URL });
+  let id;
+  async function post(url, body) {
+    const response = await fetch(`${base}${url}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const data = await response.json();
+    assert.ok(response.ok, `${url}: ${JSON.stringify(data)}`);
+    return data;
+  }
+  async function workspace() {
+    const response = await fetch(`${base}/api/projects/${id}`);
+    assert.equal(response.status, 200);
+    return response.json();
+  }
+  async function ready() {
+    for (let i = 0; i < 60; i++) {
+      const current = await workspace();
+      const failure = current.sessions.find((session) => session.pain_points_json?.error);
+      assert.ok(!failure, JSON.stringify(failure));
+      if (current.project.status === "CANDIDATES_READY") return current;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    assert.fail("Transcript analysis did not finish");
+  }
+  async function save(sessionId, text, filename = "workshop.vtt") {
+    const form = new FormData();
+    form.set("file", new File([text], filename, { type: "text/vtt" }));
+    return fetch(`${base}/api/projects/${id}/workshops/${sessionId}/transcript`, { method: "POST", body: form });
+  }
+  const vtt = (text) => `WEBVTT\n\n00:00:01.000 --> 00:00:04.000\n${text}\n`;
+  try {
+    id = (await post("/api/projects", {
+      title: "Transcript corrections", description: "Preserve workshop identity and delivery history", target_systems: [],
+    })).id;
+    const first = await post(`/api/projects/${id}/workshops`, {
+      title: "Held workshop", notes: "Keep these notes", scheduled_at: "2026-12-01T10:00:00.000Z",
+      meeting_url: "https://teams.microsoft.com/retained",
+    });
+    const second = await post(`/api/projects/${id}/workshops`, { title: "Second workshop", notes: "Separate source" });
+    await post(`/api/projects/${id}/agenda`, { session_id: first.id });
+    const originalAgenda = (await workspace()).sessions.find((session) => session.id === first.id).agenda;
+    assert.equal((await save(first.id, "invalid VTT")).status, 400);
+    assert.equal((await save("00000000-0000-4000-8000-000000000001", vtt("Foreign workshop"))).status, 404);
+    assert.equal((await save(first.id, vtt("WRONG ORIGINAL TRANSCRIPT"))).status, 200);
+    let current = await workspace();
+    let workshop = current.sessions.find((session) => session.id === first.id);
+    assert.equal(workshop.processed_at, null, "Saving must not automatically call AI");
+    assert.equal(workshop.pain_points_json.status, "pending");
+    const wrongPath = workshop.transcript_path;
+    assert.match(await readFile(wrongPath, "utf8"), /WRONG ORIGINAL/);
+    await post(`/api/projects/${id}/analyze`, { session_id: first.id });
+    current = await ready();
+    const originalCandidate = current.candidates[0].id;
+    await post(`/api/projects/${id}/approve`, { candidate_id: originalCandidate, delivery_mode: "PROMPTS" });
+    current = await workspace();
+    const originalDelivery = current.project.active_delivery_id;
+    const originalArtifact = current.artifacts[0].path;
+    const originalContent = await readFile(path.join(process.env.MEDIA_DIR, id, "artifacts", originalArtifact), "utf8");
+    assert.match(originalContent, /WRONG ORIGINAL TRANSCRIPT/);
+    assert.equal((await save(first.id, vtt("CORRECTED TRANSCRIPT"), "corrected.vtt")).status, 200);
+    current = await workspace();
+    workshop = current.sessions.find((session) => session.id === first.id);
+    assert.equal(current.project.active_delivery_id, originalDelivery);
+    assert.ok(current.candidates.every((candidate) => candidate.is_superseded));
+    assert.equal(workshop.transcript_filename, "corrected.vtt");
+    assert.equal(workshop.agenda, originalAgenda);
+    assert.equal(workshop.notes, "Keep these notes");
+    assert.equal(workshop.scheduled_at, "2026-12-01T10:00:00.000Z");
+    assert.equal(workshop.meeting_url, "https://teams.microsoft.com/retained");
+    assert.equal(workshop.pain_points_json.status, "pending");
+    assert.equal(workshop.current_state_mermaid, null);
+    await assert.rejects(readFile(wrongPath), { code: "ENOENT" });
+    const outdated = await post(`/api/projects/${id}/prompts`, { candidate_id: originalCandidate });
+    assert.match(outdated.prompt, /VANHENTUNUT/);
+    assert.match(outdated.prompt, /CORRECTED TRANSCRIPT/);
+    assert.doesNotMatch(outdated.prompt, /WRONG ORIGINAL TRANSCRIPT/);
+    const staleApproval = await fetch(`${base}/api/projects/${id}/approve`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ candidate_id: originalCandidate, delivery_mode: "PLAN", expected_delivery_id: originalDelivery }),
+    });
+    assert.equal(staleApproval.status, 409);
+    assert.equal((await save(second.id, vtt("SEPARATE WORKSHOP TRANSCRIPT"))).status, 200);
+    await post(`/api/projects/${id}/analyze`, { session_id: first.id });
+    current = await ready();
+    assert.equal(current.candidates.filter((candidate) => !candidate.is_superseded).length, 3);
+    assert.ok(current.candidates.find((candidate) => candidate.id === originalCandidate).is_superseded);
+    const nextCandidate = current.candidates.find((candidate) => !candidate.is_superseded).id;
+    const portable = await post(`/api/projects/${id}/prompts`, { candidate_id: nextCandidate });
+    assert.match(portable.prompt, /CORRECTED TRANSCRIPT/);
+    assert.match(portable.prompt, /SEPARATE WORKSHOP TRANSCRIPT/);
+    await post(`/api/projects/${id}/approve`, {
+      candidate_id: nextCandidate, delivery_mode: "PLAN", expected_delivery_id: originalDelivery,
+    });
+    assert.equal(await readFile(path.join(process.env.MEDIA_DIR, id, "artifacts", originalArtifact), "utf8"), originalContent);
+    current = await workspace();
+    const correctedPath = current.sessions.find((session) => session.id === first.id).transcript_path;
+    const videoPath = path.join(process.env.MEDIA_DIR, id, "retained-recording.mp4");
+    await writeFile(videoPath, "Recording fixture must not be deleted");
+    await db.query("UPDATE sessions SET video_path=$2 WHERE id=$1", [first.id, videoPath]);
+    const removed = await fetch(`${base}/api/projects/${id}/workshops/${first.id}/transcript`, { method: "DELETE" });
+    assert.equal(removed.status, 200);
+    workshop = (await workspace()).sessions.find((session) => session.id === first.id);
+    assert.equal(workshop.transcript_vtt, null);
+    assert.equal(workshop.transcript_path, null);
+    assert.equal(workshop.video_path, videoPath);
+    assert.equal(workshop.agenda, originalAgenda);
+    assert.match(await readFile(videoPath, "utf8"), /must not be deleted/);
+    await assert.rejects(readFile(correctedPath), { code: "ENOENT" });
+    const otherTranscript = (await workspace()).sessions.find((session) => session.id === second.id).transcript_vtt;
+    assert.match(otherTranscript, /SEPARATE WORKSHOP/);
+    const secondPath = (await workspace()).sessions.find((session) => session.id === second.id).transcript_path;
+    assert.equal((await fetch(`${base}/api/projects/${id}/workshops/${second.id}/transcript`, { method: "DELETE" })).status, 200);
+    const emptied = (await workspace()).sessions.find((session) => session.id === second.id);
+    assert.equal(emptied.video_path, null);
+    assert.equal(emptied.transcript_vtt, null);
+    assert.equal(emptied.title, "Second workshop");
+    await assert.rejects(readFile(secondPath), { code: "ENOENT" });
+    assert.equal((await save(second.id, vtt("REATTACHED CORRECT TRANSCRIPT"))).status, 200);
+  } finally {
+    if (id) {
+      await db.query("DELETE FROM projects WHERE id=$1", [id]);
       await rm(path.join(process.env.MEDIA_DIR, id), { recursive: true, force: true });
     }
     await db.end();

@@ -1,0 +1,10 @@
+BEGIN;
+ALTER TABLE solution_candidates
+    ADD COLUMN IF NOT EXISTS solution_type VARCHAR(16) NOT NULL DEFAULT 'TECHNICAL'
+        CHECK (solution_type IN ('TECHNICAL', 'PROCESS', 'HYBRID')),
+    ADD COLUMN IF NOT EXISTS implementation_status VARCHAR(16) NOT NULL DEFAULT 'NOT_STARTED'
+        CHECK (implementation_status IN ('NOT_STARTED', 'IN_PROGRESS', 'BLOCKED', 'IN_REVIEW', 'COMPLETED')),
+    ADD COLUMN IF NOT EXISTS implementation_notes TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS implementation_url TEXT,
+    ADD COLUMN IF NOT EXISTS implementation_updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+COMMIT;

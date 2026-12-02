@@ -1,0 +1,247 @@
+# FRWDeployments
+
+A facilitated Forward Deployment workspace: turn context and multiple workshops
+into solution candidates, reviewable artifacts, implementation plans and
+ready-to-use GitHub Copilot or Claude prompts.
+
+**An agent farm is optional, not the default outcome.** A reviewed live canvas,
+prompt package or implementation plan may be sufficient. Code generation starts
+only when agent delivery is explicitly selected.
+
+## Quick start
+
+Requires Docker Desktop and Docker Compose v2. For a fresh installation:
+
+```sh
+cp .env.example .env
+docker compose up --build -d
+docker compose logs -f frw_web frw_worker
+```
+
+The local `.env` already exists. Do not overwrite it when upgrading.
+
+| Service | Default address | This workspace |
+| --- | --- | --- |
+| Project workspace | http://localhost:3000 | http://localhost:3001 |
+| Worker / OpenAPI | http://localhost:8000/docs | http://localhost:18001/docs |
+| PostgreSQL 16 + pgvector | localhost:5433 | localhost:5435 |
+
+Set `WEB_PORT`, `WORKER_PORT` and `POSTGRES_PORT` in `.env` when ports are occupied.
+Do not stop unrelated applications. Internal addresses stay `frw_postgres:5432`
+and `http://frw_worker:8000`. Both applications share `/app/media`.
+
+The web container builds and starts Next.js in production mode for a stable
+local demo; it is **not a hardened production deployment**. Source directories
+are mounted, but changes require `docker compose restart frw_web frw_worker`.
+After changing web dependencies, run `docker compose exec frw_web npm ci`
+before restarting. For interactive web development, run `npm run dev` in
+[web](web/) with the appropriate database and worker environment variables.
+
+### Upgrading an existing database
+
+[db/init.sql](db/init.sql) runs only against an empty database. Apply the
+additive migrations in order to an older installation:
+
+```sh
+for migration in db/migrations/*.sql; do
+  docker compose exec -T frw_postgres psql -U frw_admin -d frwdeployments \
+    -v ON_ERROR_STOP=1 < "$migration" || break
+done
+```
+
+Use your configured database credentials. Migrations preserve existing data.
+Migration 006 gives existing projects Finnish content language.
+
+## Finnish and English
+
+Use **FI / EN** in the top navigation. The preference is saved in a browser
+cookie for one year and applies across projects and reloads.
+
+New projects have a separate **content language**, defaulting to the current
+UI language. Agendas, analysis, agent drafts and exported prompts/plans follow
+that project setting. Changing the UI language does not translate or replace
+existing projects, imported source documents, user notes or generated artifacts.
+Project content language is selected on creation; editing it later is not part
+of this MVP.
+Workshop and agent timestamps use the browser's local time zone after hydration;
+the initial server-rendered timestamps use UTC to keep rendering consistent.
+
+## Workflow
+
+1. **Create a project:** title, business goal, existing systems and content language.
+   The environment supports multiple independent project workspaces.
+2. **Gather context:** paste process descriptions or import TXT, Markdown, CSV,
+   JSON, VTT, PDF or DOCX files. PDF/DOCX extraction runs locally in the worker.
+3. **Import a GitHub source:** provide `https://github.com/owner/repo`, optionally
+   a branch/commit and a fine-grained token with **Contents: read-only** access.
+   The token is used only for that request and is never stored. Import records
+   a bounded text snapshot and commit SHA, not a clone or continuous sync.
+4. **Plan multiple workshops:** give each a title, focus, optional time and HTTPS
+   meeting link. Generate a separate timed agenda and questions for each workshop.
+   Individual agendas do not overwrite each other.
+5. **Upload workshop evidence:** attach an MP4, VTT or TXT recording/transcript
+   to a planned workshop or create a new one. Planned metadata and agenda remain.
+   Previous transcripts and analyses are retained. Before candidate approval,
+   add more context and workshops; each new synthesis considers prior workshops
+   and refreshes the current solution candidates.
+6. **Review solutions:** inspect timestamped pain points, quotes, intensity and
+   the Mermaid current-state process. Compare three candidates by benefits,
+   risks, indicative cost and architecture.
+7. **Use the live canvas:** review the relationship between the goal, selected
+   outline and delivery path, alongside architecture and emerging artifacts.
+   HTML previews are static sandboxed iframes: scripts, network access and form
+   submissions are blocked. This is not arbitrary code execution or a running
+   deployed application.
+8. **Prepare an export:** copy/download a staged Copilot or Claude prompt built
+   from the workshop history, sources and candidate. Add facilitator constraints
+   and choose **Refine draft (mock)**. Refinement is a local template operation;
+   it needs no ChatGPT key and makes no paid API calls. Unapproved candidate
+   prompts permit planning only. Check confidentiality before transferring
+   exported material to an external tool.
+9. **Approve a candidate and choose sufficient delivery:**
+   - **Prompt package** (default): persist refined Copilot and Claude Markdown
+     prompts, without starting agents.
+   - **Implementation plan:** deliver scope, milestones, decision gates, risks
+     and acceptance criteria, without automatic coding.
+   - **Agent delivery:** an explicit four-stage LangGraph chain
+     (`architect → coder → data → qa`) produces reviewable draft artifacts.
+     Tasks, logs and canvas refresh every two seconds.
+
+Prompt and plan deliveries go directly to `READY_FOR_REVIEW`. Agent delivery
+passes through `BUILDING`. Approval stores the current refinements in immutable
+delivery files; subsequent canvas drafts do not replace those accepted exports.
+
+### Track implementation outside the workspace
+
+Candidates may be **technical**, **process improvements** or **hybrid**.
+Solutions remains the coordination view when implementation happens in Copilot,
+Claude or the customer's own team.
+
+The selected candidate has an independent implementation status:
+
+```text
+NOT_STARTED → IN_PROGRESS → IN_REVIEW → COMPLETED
+                  ↕
+               BLOCKED
+```
+
+Update status, progress notes and a GitHub repository/issue/PR link in Solutions
+or Delivery. **A prompt package can be ready while implementation has not started.**
+Agent delivery moves implementation to `IN_PROGRESS`, then `IN_REVIEW`; only
+a person marks it complete. GitHub progress is not synchronized automatically.
+
+## Mock mode and real integrations
+
+`MOCK_AI=true` works without API keys. Example quotes, emotional peaks,
+architecture, code and tests are explicitly labeled simulated. They are not
+observations from a recording, measured emotions or executed tests. The mock
+coder also creates a static HTML prototype for canvas review.
+
+`MOCK_AI=false` uses:
+
+- `OPENAI_API_KEY` and `OPENAI_MODEL` (default `gpt-4o-mini`) for structured
+  agendas, synthesis and LangGraph role outputs.
+- `WHISPER_MODEL` (default `whisper-1`) for MP4 audio extraction using ffmpeg
+  and Whisper transcription with segment timestamps.
+- `SIGNALS_API_URL` and optional `SIGNALS_API_KEY` for a separately implemented
+  audio/microexpression measurement service. This MVP includes the HTTP adapter,
+  **not a local wav2vec2 or MediaPipe implementation**. Multipart fields are
+  `video`, `transcript_vtt`, `language`; the expected JSON response is:
+
+```json
+{
+  "signals": [{
+    "timestamp_seconds": 12,
+    "emotion": "tentative interpretation",
+    "intensity": 0.6,
+    "audio_observation": "observation relative to the speaker baseline",
+    "microexpression_observation": "observation relative to the speaker baseline"
+  }],
+  "baseline_method": "Describe speaker-specific calibration",
+  "limitations": "Describe uncertainty and measurement limitations"
+}
+```
+
+Real video analysis fails explicitly if the signal service is not configured.
+Text-only analysis can run without it, but has no audio/face measurements and
+TXT timestamps are estimates. Failures never silently fall back to mock results.
+Provider keys remain server-side. Real AI calls can transfer input material
+to the configured providers; obtain the necessary consent first. Paid AI and
+private-token integrations are not required for the mock validation suite.
+
+## Structure and state
+
+```text
+db/init.sql                  core tables, constraints and pgvector
+db/migrations/               additive upgrades
+web/src/lib/                 types, database, media, GitHub import, prompts, locale
+web/src/components/          workspace, workshop planner, canvas, artifact review
+web/src/app/api/              server-side routes
+worker/app/pipeline/          transcription, signals and synthesis
+worker/app/agents/            four-role LangGraph chain
+worker/tests/                focused pipeline and adapter tests
+```
+
+Core tables: `projects`, `context_documents`, `sessions`, `solution_candidates`,
+`agent_tasks`. Each project has its own media under `/app/media/{project_id}/`.
+
+```text
+PREPARATION → WORKSHOP_UPLOADED → CANDIDATES_READY → BUILDING → READY_FOR_REVIEW
+                                    │
+                                    └→ another workshop → WORKSHOP_UPLOADED
+```
+
+For `PROMPTS` and `PLAN`, `CANDIDATES_READY → READY_FOR_REVIEW` skips `BUILDING`.
+`projects.delivery_mode` records the delivery choice; only `AGENTS` creates tasks.
+
+## Validation
+
+```sh
+docker compose config --quiet
+docker compose exec frw_web npm run lint
+docker compose exec frw_web npm run typecheck
+docker compose exec frw_worker python -m unittest discover -s tests -v
+```
+
+Run builds and integration tests in a separate validation stack, not while
+serving the demo from the same Next.js build directory:
+
+```sh
+docker compose exec frw_web npm run build
+docker compose exec -e TEST_WEB_URL=http://127.0.0.1:3000 frw_web npm run test:integration
+docker compose exec -T frw_postgres psql -U frw_admin -d frwdeployments \
+  -v ON_ERROR_STOP=1 < db/schema_test.sql
+```
+
+Integration tests require mock mode and an isolated development database. They
+exercise project creation, sources, multiple workshops, candidate approval,
+optional deliveries, external progress and artifacts, and remove their own
+projects/media. The SQL test rolls its changes back.
+
+## Limits and privacy
+
+- Trusted local-team MVP: no authentication, tenant isolation, secrets vault
+  or public-service authorization layer. Do not expose it directly to the internet.
+- Multiple projects have independent sources, sessions, candidates and media,
+  but this is not access isolation between customer organizations.
+- Background context: 10 MB / 100,000 extracted characters; PDF: 100 pages,
+  no scanned-document OCR. GitHub: up to 20 files, 64 KB per file and 190,000
+  characters total. Import explicitly reports snapshot limits.
+- MP4: 100 MB; UTF-8 VTT/TXT: 2 MB. Whisper's 24 MB extracted audio limit may
+  require splitting longer recordings.
+- Jobs run in one worker process, not a durable queue. Restart marks interrupted
+  jobs failed; analysis can be retried, failed agent delivery needs human review.
+- Approval locks the solution. Post-approval versioned replanning is out of scope.
+- Artifact text preview: 128 KB; download: 10 MB. Paths are confined to the
+  project's artifact directory. Generated code is never automatically executed.
+- Review, test and secure any real implementation before deployment. Emotional
+  signals are not proof of a person's internal state.
+- Obtain participant consent and source-processing/transfer rights. Do not import
+  repository secrets or unnecessary personal data. Production GitHub access needs
+  a GitHub App/OAuth and encrypted credential lifecycle.
+- **FRWDeployment Notetaker** is a future roadmap item only. The MVP does not
+  book calendars, send invitations, open meeting links in the background or join
+  calls. Workshop recording upload is manual.
+
+See [setup/API reference](COPILOT_SETUP_AND_PROMPTS.md) and
+[concept and roadmap](konsepti_ja_mvp_suunnitelma.md).

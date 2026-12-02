@@ -1,0 +1,355 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { Pool } from "pg";
+import { rm } from "node:fs/promises";
+import path from "node:path";
+
+test("language preference, project content language and English exports remain independent", { timeout: 60000 }, async () => {
+  const base = process.env.TEST_WEB_URL;
+  assert.ok(base && process.env.DATABASE_URL && process.env.MEDIA_DIR && process.env.WORKER_URL);
+  assert.equal((await (await fetch(`${process.env.WORKER_URL}/health`)).json()).mock_ai, true);
+  const db = new Pool({ connectionString: process.env.DATABASE_URL });
+  const projects = [];
+  const post = async (url, body, cookie = "frw_locale=en") => {
+    const response = await fetch(`${base}${url}`, {
+      method: "POST", headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json();
+    assert.ok(response.ok, `${url}: ${JSON.stringify(data)}`);
+    return { response, data };
+  };
+  try {
+    const preference = await post("/api/locale", { locale: "en" });
+    assert.match(preference.response.headers.get("set-cookie"), /frw_locale=en/);
+    assert.match(preference.response.headers.get("set-cookie"), /HttpOnly/i);
+    const html = await (await fetch(base, { headers: { Cookie: "frw_locale=en" } })).text();
+    assert.match(html, /lang="en"/);
+    assert.match(html, /Create a new FRWDeployments project/);
+    const finnish = await (await fetch(base, { headers: { Cookie: "frw_locale=fi" } })).text();
+    assert.match(finnish, /lang="fi"/);
+    assert.match(finnish, /Luo uusi FRWDeployments-projekti/);
+    const invalid = await fetch(`${base}/api/locale`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: '{"locale":"de"}',
+    });
+    assert.equal(invalid.status, 400);
+    const foreign = await fetch(`${base}/api/locale`, {
+      method: "POST", headers: { "Content-Type": "application/json", Origin: "https://other.invalid" },
+      body: '{"locale":"en"}',
+    });
+    assert.equal(foreign.status, 403);
+    const missing = await fetch(`${base}/api/projects/00000000-0000-4000-8000-000000000001`, {
+      headers: { Cookie: "frw_locale=en" },
+    });
+    assert.equal(missing.status, 404);
+    assert.equal((await missing.json()).error, "Project not found.");
+
+    const created = await post("/api/projects", {
+      title: "Language workflow test", description: "Preserve the source text", target_systems: ["CRM"],
+    });
+    const id = created.data.id;
+    projects.push(id);
+    assert.equal(created.data.language, "en", "Creation defaults to the current UI language");
+    const explicit = await post("/api/projects", {
+      title: "Explicit language", description: "Suomenkielinen projekti", target_systems: [], language: "fi",
+    });
+    projects.push(explicit.data.id);
+    assert.equal(explicit.data.language, "fi", "An explicit content language overrides the UI");
+    await post(`/api/projects/${id}/context`, { filename: "Source", content_text: "Alkuperäinen lähde säilyy." });
+    const workshop = await post(`/api/projects/${id}/workshops`, { title: "Pilot review", notes: "Verify ownership" });
+    const agenda = await post(`/api/projects/${id}/agenda`, { session_id: workshop.data.id }, "frw_locale=fi");
+    assert.match(agenda.data.agenda, /# Workshop agenda: Pilot review/);
+    assert.match(agenda.data.agenda, /Verify ownership/);
+    const form = new FormData();
+    form.set("file", new File(["Original English workshop transcript."], "workshop.txt", { type: "text/plain" }));
+    form.set("session_id", workshop.data.id);
+    const upload = await fetch(`${base}/api/projects/${id}/sessions`, { method: "POST", body: form });
+    assert.equal(upload.status, 202);
+    let workspace;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      workspace = await (await fetch(`${base}/api/projects/${id}`)).json();
+      if (workspace.project.status === "CANDIDATES_READY") break;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    assert.equal(workspace.project.status, "CANDIDATES_READY");
+    assert.match(workspace.candidates[0].title, /simulated option/);
+    assert.equal(workspace.documents[0].content_text, "Alkuperäinen lähde säilyy.");
+    assert.match(workspace.sessions[0].transcript_vtt, /Original English workshop transcript/);
+    for (const target of ["copilot", "claude", "plan"]) {
+      const draft = await post(`/api/projects/${id}/prompts`, {
+        candidate_id: workspace.candidates[0].id, target, refinement: "Keep the pilot small.",
+      }, "frw_locale=fi");
+      assert.match(draft.data.prompt, target === "plan" ? /# Implementation plan:/ : /Forward Deployment implementation prompt/);
+      assert.match(draft.data.prompt, /Keep the pilot small/);
+      if (target !== "plan") assert.match(draft.data.prompt, /Alkuperäinen lähde säilyy/);
+    }
+    await post(`/api/projects/${id}/approve`, { candidate_id: workspace.candidates[0].id, delivery_mode: "PROMPTS" });
+    workspace = await (await fetch(`${base}/api/projects/${id}`)).json();
+    assert.equal(workspace.project.language, "en");
+    assert.equal(workspace.tasks.length, 0);
+    for (const artifact of workspace.artifacts) {
+      const preview = await (await fetch(`${base}/api/projects/${id}/artifacts?path=${encodeURIComponent(artifact.path)}`)).json();
+      assert.match(preview.content, /The customer has selected this candidate/);
+      assert.doesNotMatch(preview.content, /NOT APPROVED/);
+    }
+  } finally {
+    for (const id of projects) {
+      await db.query("DELETE FROM projects WHERE id=$1", [id]);
+      await rm(path.join(process.env.MEDIA_DIR, id), { recursive: true, force: true });
+    }
+    await db.end();
+  }
+});
+
+test("mock workspace: preparation, upload, analysis, selection and four-agent delivery", { timeout: 90000 }, async () => {
+  const base = process.env.TEST_WEB_URL;
+  assert.ok(base, "Set TEST_WEB_URL to an isolated running web service");
+  assert.ok(process.env.DATABASE_URL);
+  assert.ok(process.env.MEDIA_DIR);
+  assert.ok(process.env.WORKER_URL);
+  const workerHealth = await fetch(`${process.env.WORKER_URL}/health`);
+  assert.equal((await workerHealth.json()).mock_ai, true, "This test must never call real AI providers");
+  const db = new Pool({ connectionString: process.env.DATABASE_URL });
+  const projects = [];
+  async function call(url, options = {}) {
+    const response = await fetch(`${base}${url}`, options);
+    return { status: response.status, data: await response.json() };
+  }
+  const post = (body) => ({
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+
+  test("prompt-package and plan deliveries finish without agent tasks or AI keys", { timeout: 30000 }, async () => {
+    const base = process.env.TEST_WEB_URL;
+    assert.ok(base);
+    const db = new Pool({ connectionString: process.env.DATABASE_URL });
+    const projects = [];
+    async function post(url, body) {
+      const response = await fetch(`${base}${url}`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+      return { status: response.status, data: await response.json() };
+    }
+    try {
+      for (const delivery_mode of ["PROMPTS", "PLAN"]) {
+        const created = await post("/api/projects", {
+          title: `Toimitustesti ${delivery_mode}`, description: "Asiakkaalle riittää suunnitelma tai promptit.", target_systems: [],
+        });
+        assert.equal(created.status, 201);
+        const id = created.data.id;
+        projects.push(id);
+        const candidate = await db.query(
+          `INSERT INTO solution_candidates (project_id,title,summary,benefits,risks,estimated_cost,architecture_spec)
+           VALUES ($1,'Prosessin yksinkertaistus','Ei koodia oletuksena','["Vähemmän käsityötä"]',
+           '["Vastuut varmistettava"]',1000,'Prosessikuvaus ja pilotin suunnittelu') RETURNING id`, [id],
+        );
+        const candidate_id = candidate.rows[0].id;
+        await db.query("UPDATE projects SET status='CANDIDATES_READY' WHERE id=$1", [id]);
+        const refinement = "Pilotti ilman integraatioita; mittaa käsittelyaika.";
+        const draft = await post(`/api/projects/${id}/prompts`, { candidate_id, target: "plan", refinement });
+        assert.equal(draft.status, 200);
+        assert.equal(draft.data.mock, true);
+        assert.match(draft.data.prompt, /Pilotti ilman integraatioita/);
+        const approved = await post(`/api/projects/${id}/approve`, { candidate_id, delivery_mode, refinement });
+        assert.equal(approved.status, 200);
+        const workspace = await (await fetch(`${base}/api/projects/${id}`)).json();
+        assert.equal(workspace.project.status, "READY_FOR_REVIEW");
+        assert.equal(workspace.project.delivery_mode, delivery_mode);
+        assert.equal(workspace.tasks.length, 0, "Non-agent deliveries must never create agent tasks");
+        assert.equal(workspace.candidates[0].implementation_status, "NOT_STARTED",
+          "Exported prompts are not a completed implementation");
+        assert.equal(workspace.artifacts.length, delivery_mode === "PROMPTS" ? 2 : 1);
+        const preview = await (await fetch(`${base}/api/projects/${id}/artifacts?path=${encodeURIComponent(workspace.artifacts[0].path)}`)).json();
+        assert.match(preview.content, /Pilotti ilman integraatioita/);
+        if (delivery_mode === "PROMPTS") assert.doesNotMatch(preview.content, /EI HYVÄKSYTTY/);
+        assert.equal((await post(`/api/projects/${id}/approve`, { candidate_id, delivery_mode, refinement })).status, 200);
+        const repeated = await (await fetch(`${base}/api/projects/${id}`)).json();
+        assert.equal(repeated.artifacts.length, workspace.artifacts.length, "Repeated approval must not duplicate exports");
+        const progress = await fetch(`${base}/api/projects/${id}/implementation`, {
+          method: "PATCH", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            candidate_id, implementation_status: "IN_PROGRESS",
+            implementation_notes: "Toteutus GH Copilotissa, ensimmäinen PR katselmoitavana.",
+            implementation_url: "https://github.com/example/project/pull/42",
+          }),
+        });
+        assert.equal(progress.status, 200);
+        assert.equal((await progress.json()).implementation_status, "IN_PROGRESS");
+        const tracked = await (await fetch(`${base}/api/projects/${id}`)).json();
+        assert.equal(tracked.project.status, "READY_FOR_REVIEW", "Delivery readiness is independent of implementation progress");
+        assert.equal(tracked.tasks.length, 0);
+        assert.match(tracked.candidates[0].implementation_notes, /GH Copilotissa/);
+        assert.equal(tracked.candidates[0].implementation_url, "https://github.com/example/project/pull/42");
+      }
+    } finally {
+      for (const id of projects) {
+        await db.query("DELETE FROM projects WHERE id=$1", [id]);
+        await rm(path.join(process.env.MEDIA_DIR, id), { recursive: true, force: true });
+      }
+      await db.end();
+    }
+  });
+  async function waitFor(id, predicate) {
+    for (let attempt = 0; attempt < 80; attempt++) {
+      const response = await call(`/api/projects/${id}`);
+      assert.equal(response.status, 200);
+      if (predicate(response.data)) return response.data;
+      const errors = response.data.sessions.filter((session) => session.pain_points_json?.error);
+      const failed = response.data.tasks.filter((task) => task.status === "failed");
+      assert.equal(errors.length, 0, JSON.stringify(errors));
+      assert.equal(failed.length, 0, JSON.stringify(failed));
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    assert.fail("Workflow did not finish within 40 seconds");
+  }
+  try {
+    assert.equal((await call("/api/projects", post({ title: "", description: "", target_systems: [] }))).status, 400);
+    assert.equal((await call("/api/projects/not-a-uuid")).status, 400);
+    assert.equal((await call("/api/projects", {
+      ...post({ title: "Blocked", description: "Blocked", target_systems: [] }),
+      headers: { "Content-Type": "application/json", Origin: "http://untrusted.invalid" },
+    })).status, 403);
+    const created = await call("/api/projects", post({
+      title: "Integraatiotesti: asiakaspalautteet",
+      description: "Lyhennetään palautteiden käsittelyaikaa ja poistetaan Excelin käsityö.",
+      target_systems: ["Teams", "Excel", "CRM"],
+    }));
+    assert.equal(created.status, 201);
+    const id = created.data.id;
+    projects.push(id);
+    assert.equal(created.data.status, "PREPARATION");
+    assert.deepEqual(created.data.target_systems, ["Teams", "Excel", "CRM"]);
+    const route = `/api/projects/${id}`;
+    assert.equal((await call(`${route}/context`, post({
+      filename: "Nykyprosessi",
+      content_text: "Palautteet siirretään sähköpostista Exceliin. Vastuu on epäselvä, eikä asiakas näe käsittelyn tilaa.",
+    }))).status, 201);
+    const agenda = await call(`${route}/agenda`, post({}));
+    assert.equal(agenda.status, 200);
+    assert.ok(agenda.data.agenda.length > 200);
+    let snapshot = (await call(route)).data;
+    assert.equal(snapshot.documents.length, 1);
+    assert.equal(snapshot.project.workshop_agenda, agenda.data.agenda);
+    const contextFile = new FormData();
+    contextFile.set("file", new File(["# Prosessi\nPalautteet kopioidaan Exceliin."], "process.md"));
+    const imported = await call(`${route}/context/file`, { method: "POST", body: contextFile });
+    assert.equal(imported.status, 201);
+    assert.equal(imported.data.source_type, "file");
+    assert.match(imported.data.content_text, /Excel/);
+    const disallowedGithub = await call(`${route}/context/github`, post({
+      url: "http://127.0.0.1/private", token: "not-a-real-token",
+    }));
+    assert.equal(disallowedGithub.status, 400);
+    const invalid = new FormData();
+    invalid.set("file", new File(["bad"], "../bad.exe"));
+    assert.equal((await call(`${route}/sessions`, { method: "POST", body: invalid })).status, 400);
+    assert.equal((await call(route)).data.sessions.length, 0);
+    const forgedVideo = new FormData();
+    forgedVideo.set("file", new File(["not a video"], "fake.mp4"));
+    assert.equal((await call(`${route}/sessions`, { method: "POST", body: forgedVideo })).status, 400);
+    const plannedFirst = await call(`${route}/workshops`, post({
+      title: "Työpaja 1: nykytila", notes: "Kartoitetaan vastuut ja käsityövaiheet.",
+      scheduled_at: "2026-12-01T08:00:00.000Z", meeting_url: "https://teams.microsoft.com/example",
+    }));
+    assert.equal(plannedFirst.status, 201);
+    assert.equal(plannedFirst.data.video_path, null);
+    const firstAgenda = await call(`${route}/agenda`, post({ session_id: plannedFirst.data.id }));
+    assert.equal(firstAgenda.status, 200);
+    assert.match(firstAgenda.data.agenda, /Työpaja 1: nykytila/);
+    assert.match(firstAgenda.data.agenda, /Kartoitetaan vastuut/);
+    const upload = new FormData();
+    upload.set("session_id", plannedFirst.data.id);
+    upload.set("file", new File([
+      "WEBVTT\n\n00:00:12.000 --> 00:00:20.000\nPalautteet kopioidaan käsin Exceliin, eikä kukaan tiedä kenen vastuulla vastaus on.\n\n00:01:00.000 --> 00:01:08.000\nCRM:ssä on samat tiedot, mutta integraatio puuttuu.\n",
+    ], "../../workshop.vtt", { type: "text/vtt" }));
+    const uploaded = await call(`${route}/sessions`, { method: "POST", body: upload });
+    assert.equal(uploaded.status, 202);
+    snapshot = await waitFor(id, (value) => value.project.status === "CANDIDATES_READY");
+    assert.equal(snapshot.sessions.length, 1);
+    assert.equal(snapshot.sessions[0].id, plannedFirst.data.id);
+    assert.equal(snapshot.sessions[0].agenda, firstAgenda.data.agenda);
+    assert.ok(snapshot.sessions[0].video_path.startsWith(path.join(process.env.MEDIA_DIR, id)));
+    assert.ok(Array.isArray(snapshot.sessions[0].pain_points_json));
+    assert.ok(snapshot.sessions[0].pain_points_json.length > 0);
+    for (const point of snapshot.sessions[0].pain_points_json) {
+      assert.ok(point.timestamp_seconds >= 0);
+      assert.ok(point.intensity >= 0 && point.intensity <= 1);
+      assert.equal(typeof point.quote, "string");
+    }
+    assert.match(snapshot.sessions[0].current_state_mermaid, /flowchart|graph/);
+    assert.equal(snapshot.candidates.length, 3);
+    for (const candidate of snapshot.candidates) {
+      assert.ok(candidate.benefits.length);
+      assert.ok(candidate.risks.length);
+      assert.ok(candidate.estimated_cost > 0);
+      assert.ok(candidate.architecture_spec);
+    }
+    const firstSessionId = snapshot.sessions[0].id;
+    const plannedSecond = await call(`${route}/workshops`, post({
+      title: "Työpaja 2: validointi", notes: "Varmennetaan pilotin hyväksymiskriteerit.",
+    }));
+    assert.equal(plannedSecond.status, 201);
+    const secondAgenda = await call(`${route}/agenda`, post({ session_id: plannedSecond.data.id }));
+    assert.equal(secondAgenda.status, 200);
+    assert.match(secondAgenda.data.agenda, /Työpaja 2: validointi/);
+    assert.match(secondAgenda.data.agenda, /Varmennetaan pilotin/);
+    assert.notEqual(firstAgenda.data.agenda, secondAgenda.data.agenda);
+    const secondUpload = new FormData();
+    secondUpload.set("session_id", plannedSecond.data.id);
+    secondUpload.set("title", "Työpaja 2: validointi");
+    secondUpload.set("file", new File(["Toisessa työpajassa varmistettiin asiakkaan tavoite ja vastuuhenkilöt."], "workshop2.txt"));
+    assert.equal((await call(`${route}/sessions`, { method: "POST", body: secondUpload })).status, 202);
+    snapshot = await waitFor(id, (value) => value.project.status === "CANDIDATES_READY" && value.sessions.length === 2);
+    assert.ok(snapshot.sessions.some((session) => session.id === firstSessionId && session.processed_at));
+    assert.equal(snapshot.sessions[0].title, "Työpaja 2: validointi");
+    assert.equal(snapshot.sessions.find((session) => session.id === firstSessionId).agenda, firstAgenda.data.agenda);
+    assert.equal(snapshot.sessions[0].agenda, secondAgenda.data.agenda);
+    for (const target of ["copilot", "claude"]) {
+      const prompt = await call(`${route}/prompts?target=${target}&candidate_id=${snapshot.candidates[0].id}`);
+      assert.equal(prompt.status, 200);
+      assert.match(prompt.data.prompt, /Työpajoja: 2/);
+      assert.match(prompt.data.prompt, /EI HYVÄKSYTTY/);
+      assert.match(prompt.data.prompt, /Prosessi/);
+      assert.doesNotMatch(prompt.data.prompt, /not-a-real-token/);
+    }
+    const other = await call("/api/projects", post({ title: "Toinen projekti", description: "Viiteavaintesti", target_systems: [] }));
+    projects.push(other.data.id);
+    assert.ok([404, 409].includes((await call(`/api/projects/${other.data.id}/build`, post({
+      candidate_id: snapshot.candidates[0].id,
+    }))).status));
+    const chosen = snapshot.candidates[0].id;
+    assert.equal((await call(`${route}/build`, post({ candidate_id: chosen }))).status, 202);
+    const started = (await call(route)).data;
+    assert.equal(started.project.status, "BUILDING");
+    assert.equal(started.candidates.filter((candidate) => candidate.is_selected).length, 1);
+    assert.equal(started.tasks.length, 4);
+    assert.ok(started.tasks.some((task) => task.status === "pending" || task.status === "running"));
+    const duplicate = await call(`${route}/build`, post({ candidate_id: chosen }));
+    assert.ok([202, 409].includes(duplicate.status));
+    snapshot = await waitFor(id, (value) => value.project.status === "READY_FOR_REVIEW");
+    assert.equal(snapshot.tasks.length, 4, "Duplicate requests must not create duplicate tasks");
+    assert.deepEqual(snapshot.tasks.map((task) => task.agent_role).sort(), ["architect", "coder", "data", "qa"]);
+    assert.ok(snapshot.tasks.every((task) => task.status === "completed" && task.output_log && task.artifacts_path));
+    assert.equal(snapshot.project.delivery_mode, "AGENTS");
+    assert.equal(snapshot.candidates.find((candidate) => candidate.is_selected).implementation_status, "IN_REVIEW");
+    assert.ok(snapshot.artifacts.length >= 4);
+    const file = snapshot.artifacts.find((artifact) => /\.py$|\.ts$|\.md$/.test(artifact.path));
+    assert.ok(file);
+    const preview = await call(`${route}/artifacts?path=${encodeURIComponent(file.path)}`);
+    assert.equal(preview.status, 200);
+    assert.ok(preview.data.content.length);
+    const download = await fetch(`${base}${route}/artifacts?path=${encodeURIComponent(file.path)}&download=1`);
+    assert.equal(download.status, 200);
+    assert.match(download.headers.get("content-disposition"), /^attachment/);
+    assert.equal(await download.text(), preview.data.content);
+    assert.equal((await call(`${route}/artifacts?path=${encodeURIComponent("../outside.txt")}`)).status, 400);
+    assert.equal((await call(`${route}/context`, post({ filename: "Late", content_text: "Not allowed" }))).status, 409);
+  } finally {
+    for (const id of projects) {
+      await db.query("DELETE FROM projects WHERE id = $1", [id]);
+      assert.match(id, /^[0-9a-f-]{36}$/);
+      await rm(path.join(process.env.MEDIA_DIR, id), { recursive: true, force: true });
+    }
+    await db.end();
+  }
+});

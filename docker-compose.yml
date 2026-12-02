@@ -1,0 +1,75 @@
+version: '3.9'
+
+services:
+  frw_postgres:
+    image: pgvector/pgvector:pg16
+    container_name: frw_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-frw_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-frw_secret_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-frwdeployments}
+    ports:
+      # Use a separate host port to avoid the local PostgreSQL instance.
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - frw_pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-frw_admin} -d ${POSTGRES_DB:-frwdeployments}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  frw_worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    container_name: frw_worker
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-frw_admin}:${POSTGRES_PASSWORD:-frw_secret_pass}@frw_postgres:5432/${POSTGRES_DB:-frwdeployments}
+      MOCK_AI: ${MOCK_AI:-true}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      WHISPER_MODEL: ${WHISPER_MODEL:-whisper-1}
+      SIGNALS_API_URL: ${SIGNALS_API_URL:-}
+      SIGNALS_API_KEY: ${SIGNALS_API_KEY:-}
+      MEDIA_DIR: /app/media
+    ports:
+      - "${WORKER_PORT:-8000}:8000"
+    volumes:
+      - ./worker:/app
+      - frw_media_storage:/app/media
+    depends_on:
+      frw_postgres:
+        condition: service_healthy
+
+  frw_web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: frw_web
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-frw_admin}:${POSTGRES_PASSWORD:-frw_secret_pass}@frw_postgres:5432/${POSTGRES_DB:-frwdeployments}
+      WORKER_URL: http://frw_worker:8000
+      MEDIA_DIR: /app/media
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    volumes:
+      - ./web:/app
+      - /app/node_modules
+      - /app/.next
+      - frw_media_storage:/app/media
+    depends_on:
+      frw_postgres:
+        condition: service_healthy
+      frw_worker:
+        condition: service_started
+
+volumes:
+  frw_pgdata:
+  frw_media_storage:

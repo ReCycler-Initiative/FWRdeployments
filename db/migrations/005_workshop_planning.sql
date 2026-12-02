@@ -1,0 +1,9 @@
+BEGIN;
+ALTER TABLE sessions
+    ADD COLUMN IF NOT EXISTS agenda TEXT,
+    ADD COLUMN IF NOT EXISTS notes TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS meeting_url TEXT,
+    ADD COLUMN IF NOT EXISTS uploaded_at TIMESTAMPTZ;
+UPDATE sessions SET uploaded_at = created_at WHERE video_path IS NOT NULL AND uploaded_at IS NULL;
+COMMIT;
